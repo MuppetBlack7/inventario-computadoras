@@ -146,6 +146,9 @@ export default function App() {
     })
 
     void prepareFirebaseAuth()
+      .then((redirectUser) => {
+        if (redirectUser) initialUser = redirectUser
+      })
       .catch((error) => {
         const message = describeFirebaseAuthError(error)
         console.error('Firebase Auth: getRedirectResult falló', error)

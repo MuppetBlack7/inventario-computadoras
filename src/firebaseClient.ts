@@ -7,7 +7,8 @@ import {
   indexedDBLocalPersistence,
   setPersistence,
   signInWithPopup,
-  signInWithRedirect
+  signInWithRedirect,
+  type User
 } from 'firebase/auth'
 import { getFirestore } from 'firebase/firestore'
 import { getStorage } from 'firebase/storage'
@@ -32,7 +33,7 @@ export const firestore = app ? getFirestore(app) : null
 export const firebaseStorage = app && storageEnabled ? getStorage(app) : null
 
 let persistencePromise: Promise<void> | undefined
-let redirectResultPromise: Promise<void> | undefined
+let redirectResultPromise: Promise<User | null> | undefined
 
 export function describeFirebaseAuthError(error: unknown) {
   const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : ''
@@ -59,12 +60,13 @@ async function configureAuthPersistence() {
 }
 
 export async function prepareFirebaseAuth() {
-  if (!firebaseAuth) return
+  if (!firebaseAuth) return null
   await configureAuthPersistence()
   if (!redirectResultPromise) {
-    redirectResultPromise = getRedirectResult(firebaseAuth).then(() => undefined)
+    redirectResultPromise = getRedirectResult(firebaseAuth).then((result) => result?.user || null)
   }
   await redirectResultPromise
+  return redirectResultPromise
 }
 
 export async function signInWithGoogle() {
