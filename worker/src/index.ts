@@ -24,6 +24,7 @@ const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
 const ALLOWED_ORIGINS = new Set([
   'https://inventario-computadoras-rc26.web.app',
   'https://inventario-computadoras-rc26.firebaseapp.com',
+  'https://inventario-computadoras.vercel.app',
   'http://localhost:4173',
   'http://localhost:4174',
   'http://localhost:5173'

@@ -16,6 +16,8 @@ En la PC abre `http://localhost:4173`.
 
 Producción Firebase HTTPS: <https://inventario-computadoras-rc26.web.app>
 
+Producción Vercel HTTPS: <https://inventario-computadoras.vercel.app>
+
 ## Abrir desde iPhone o iPad con HTTPS
 
 La forma preparada usa un túnel HTTPS temporal. PC e iPhone necesitan Internet mientras se realiza la primera carga:
