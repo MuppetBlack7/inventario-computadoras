@@ -1,0 +1,2 @@
+# Solo para desarrollo local. Copia como .dev.vars; nunca confirmes el archivo real.
+IMAGEKIT_PRIVATE_KEY=

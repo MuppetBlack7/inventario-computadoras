@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "inventario-computadoras-imagekit",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-09",
+  "workers_dev": true,
+  "preview_urls": false,
+  "vars": {
+    "FIREBASE_PROJECT_ID": "inventario-computadoras-rc26",
+    "IMAGEKIT_URL_ENDPOINT": "https://ik.imagekit.io/pojadsfzj"
+  },
+  "secrets": {
+    "required": ["IMAGEKIT_PRIVATE_KEY"]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  }
+}
