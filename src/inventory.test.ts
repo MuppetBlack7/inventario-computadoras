@@ -21,6 +21,7 @@ import { pendingCount } from './cloudSync'
 import type { ComputerRecord, InventorySession } from './types'
 import { normalizeKey } from './utils'
 import { isAppleMobilePlatform } from './authPlatform'
+import { describeFirebaseAuthError } from './firebaseClient'
 
 const session: InventorySession = {
   id: 'session-test', name: 'Sesión de prueba', date: '2026-10-09', location: 'Laboratorio',
@@ -45,6 +46,11 @@ describe('inventario local', () => {
     expect(isAppleMobilePlatform({ userAgent: 'Mozilla/5.0 (iPhone)', platform: 'iPhone', maxTouchPoints: 5 })).toBe(true)
     expect(isAppleMobilePlatform({ userAgent: 'Mozilla/5.0 (Macintosh)', platform: 'MacIntel', maxTouchPoints: 5 })).toBe(true)
     expect(isAppleMobilePlatform({ userAgent: 'Mozilla/5.0 (Macintosh)', platform: 'MacIntel', maxTouchPoints: 0 })).toBe(false)
+  })
+
+  it('expone los errores de Firebase Auth de forma visible y útil', () => {
+    expect(describeFirebaseAuthError({ code: 'auth/unauthorized-domain', message: 'ignored' })).toContain('auth/unauthorized-domain')
+    expect(describeFirebaseAuthError({ code: 'auth/operation-not-allowed', message: 'ignored' })).toContain('Google')
   })
 
   it('crea sesiones, guarda equipos y persiste al volver a consultar', async () => {

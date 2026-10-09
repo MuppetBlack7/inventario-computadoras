@@ -34,6 +34,21 @@ export const firebaseStorage = app && storageEnabled ? getStorage(app) : null
 let persistencePromise: Promise<void> | undefined
 let redirectResultPromise: Promise<void> | undefined
 
+export function describeFirebaseAuthError(error: unknown) {
+  const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : ''
+  const details = error instanceof Error ? error.message : 'Firebase no proporcionó detalles adicionales.'
+  const messages: Record<string, string> = {
+    'auth/unauthorized-domain': 'Este dominio no está autorizado en Firebase Authentication.',
+    'auth/operation-not-allowed': 'El acceso con Google no está habilitado en Firebase Authentication.',
+    'auth/operation-not-supported-in-this-environment': 'Este navegador no puede abrir el flujo de acceso configurado.',
+    'auth/account-exists-with-different-credential': 'Esta cuenta ya usa otro método de acceso.',
+    'auth/popup-blocked': 'El navegador bloqueó la ventana de acceso.',
+    'auth/network-request-failed': 'No fue posible comunicarse con Firebase. Revisa la conexión.'
+  }
+  const summary = messages[code] || details
+  return code ? `${code}: ${summary}` : summary
+}
+
 async function configureAuthPersistence() {
   if (!firebaseAuth) return
   if (!persistencePromise) {

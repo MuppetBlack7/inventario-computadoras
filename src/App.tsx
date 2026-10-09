@@ -14,7 +14,7 @@ import {
   saveSession
 } from './db'
 import { migrateLegacyCloudData, pendingCount, pullCloudData, synchronize, verifyCloudOwnership, type SyncSummary } from './cloudSync'
-import { firebaseAuth, firebaseConfigured, prepareFirebaseAuth, signInWithGoogle } from './firebaseClient'
+import { describeFirebaseAuthError, firebaseAuth, firebaseConfigured, prepareFirebaseAuth, signInWithGoogle } from './firebaseClient'
 import { imageKitConfigured } from './imageKitClient'
 import type { ComputerRecord, InventorySession, SyncStatus } from './types'
 import { driveSummary, emptyComputer, formatDateTime, uid } from './utils'
@@ -39,6 +39,7 @@ export default function App() {
   const [loading, setLoading] = useState(true)
   const [authReady, setAuthReady] = useState(!firebaseAuth)
   const [toast, setToast] = useState('')
+  const [authError, setAuthError] = useState('')
   const [user, setUser] = useState<User | null>(null)
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('local')
   const [syncMessage, setSyncMessage] = useState('Guardado local')
@@ -96,39 +97,66 @@ export default function App() {
       return
     }
     let active = true
-    let unsubscribe: () => void = () => undefined
+    let redirectFinished = false
+    let initialStateObserved = false
+    let initialUser: User | null = null
+    let initialApplied = false
+
+    const applyUser = (nextUser: User | null) => {
+      if (!active) return
+      setUser(nextUser)
+      setAuthReady(true)
+      void (async () => {
+        if (nextUser) {
+          reportSync('syncing', 'Sincronizando')
+          try {
+            await migrateLegacyCloudData(nextUser)
+            await pullCloudData(nextUser.uid)
+            const preview = await getLocalImportPreview()
+            if (preview.sessions || preview.computers) setImportPreview(preview)
+            else {
+              await synchronize(nextUser.uid, reportSync)
+              await pullCloudData(nextUser.uid)
+            }
+          } catch {
+            reportSync('error', 'Error al sincronizar')
+          }
+          await refresh(nextUser.uid)
+        } else {
+          reportSync('local', 'Guardado local')
+          await refresh(null)
+        }
+      })()
+    }
+
+    const applyInitialUser = () => {
+      if (!active || initialApplied || !redirectFinished || !initialStateObserved) return
+      initialApplied = true
+      applyUser(initialUser)
+    }
+
+    const unsubscribe = onAuthStateChanged(auth, (nextUser) => {
+      if (!initialApplied) {
+        initialStateObserved = true
+        initialUser = nextUser
+        applyInitialUser()
+        return
+      }
+      applyUser(nextUser)
+    })
+
     void prepareFirebaseAuth()
       .catch((error) => {
-        if (active) setToast(error instanceof Error ? error.message : 'No fue posible restaurar la sesión')
+        const message = describeFirebaseAuthError(error)
+        console.error('Firebase Auth: getRedirectResult falló', error)
+        if (active) {
+          setAuthError(message)
+          setToast(message)
+        }
       })
       .finally(() => {
-        if (!active) return
-        unsubscribe = onAuthStateChanged(auth, (nextUser) => {
-          if (!active) return
-          setUser(nextUser)
-          setAuthReady(true)
-          void (async () => {
-            if (nextUser) {
-              reportSync('syncing', 'Sincronizando')
-              try {
-                await migrateLegacyCloudData(nextUser)
-                await pullCloudData(nextUser.uid)
-                const preview = await getLocalImportPreview()
-                if (preview.sessions || preview.computers) setImportPreview(preview)
-                else {
-                  await synchronize(nextUser.uid, reportSync)
-                  await pullCloudData(nextUser.uid)
-                }
-              } catch {
-                reportSync('error', 'Error al sincronizar')
-              }
-              await refresh(nextUser.uid)
-            } else {
-              reportSync('local', 'Guardado local')
-              await refresh(null)
-            }
-          })()
-        })
+        redirectFinished = true
+        applyInitialUser()
       })
     return () => {
       active = false
@@ -182,14 +210,14 @@ export default function App() {
           status={syncStatus}
           message={syncMessage}
           pending={pending}
-          onLogin={() => void signInWithGoogle().catch((error) => setToast(error instanceof Error ? error.message : 'No fue posible iniciar sesión'))}
+          onLogin={() => void startGoogleLogin(setAuthError, setToast)}
           onLogout={() => { if (firebaseAuth) void signOut(firebaseAuth) }}
           onSync={() => void runSync()}
         />}
       </header>
 
       {!authReady ? <div className="loading-screen"><div className="spinner" /><p>Comprobando sesión…</p></div> : loading ? <div className="loading-screen"><div className="spinner" /><p>Abriendo inventario compartido…</p></div> : !user ? (
-        <SignInGate configured={firebaseConfigured} onLogin={() => void signInWithGoogle().catch((error) => setToast(error instanceof Error ? error.message : 'No fue posible iniciar sesión'))} />
+        <SignInGate configured={firebaseConfigured} error={authError} onLogin={() => void startGoogleLogin(setAuthError, setToast)} />
       ) : (
         <>
           {view.name === 'sessions' && <SessionsScreen
@@ -290,8 +318,20 @@ function LoadingPanel({ label }: { label: string }) {
   return <div className="loading-screen"><div className="spinner" /><p>{label}</p></div>
 }
 
-function SignInGate({ configured, onLogin }: { configured: boolean; onLogin: () => void }) {
-  return <main className="screen auth-gate"><section className="empty-state"><div className="empty-illustration"><span>▦</span><span>G</span></div><p className="eyebrow">Inventario compartido</p><h1>Inicia sesión para continuar</h1><p>Cualquier persona con una cuenta de Google puede consultar el inventario y agregar registros. Las fotografías y ubicaciones son visibles para todas las cuentas que inicien sesión. Solo quien crea un registro puede editarlo o eliminarlo.</p><button className="primary-button" disabled={!configured} onClick={onLogin}><span className="google-mark">G</span> Iniciar sesión con Google</button></section></main>
+function SignInGate({ configured, error, onLogin }: { configured: boolean; error: string; onLogin: () => void }) {
+  return <main className="screen auth-gate"><section className="empty-state"><div className="empty-illustration"><span>▦</span><span>G</span></div><p className="eyebrow">Inventario compartido</p><h1>Inicia sesión para continuar</h1><p>Cualquier persona con una cuenta de Google puede consultar el inventario y agregar registros. Las fotografías y ubicaciones son visibles para todas las cuentas que inicien sesión. Solo quien crea un registro puede editarlo o eliminarlo.</p>{error && <p className="warning-box auth-error" role="alert">{error}</p>}<button className="primary-button" disabled={!configured} onClick={onLogin}><span className="google-mark">G</span> Iniciar sesión con Google</button></section></main>
+}
+
+async function startGoogleLogin(setAuthError: (message: string) => void, setToast: (message: string) => void) {
+  setAuthError('')
+  try {
+    await signInWithGoogle()
+  } catch (error) {
+    const message = describeFirebaseAuthError(error)
+    console.error('Firebase Auth: inicio de sesión con Google falló', error)
+    setAuthError(message)
+    setToast(message)
+  }
 }
 
 interface SessionsProps {

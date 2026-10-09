@@ -99,6 +99,7 @@ h2 { letter-spacing: -.025em; }
 .photo-placeholder { background: #e8eeeb; color: #647772; display: grid; place-content: center; gap: 5px; padding: 8px; text-align: center; }
 .photo-placeholder b { font-size: 1.45rem; line-height: 1; }.photo-placeholder span { max-width: 180px; font-size: .66rem; font-weight: 700; line-height: 1.25; }
 .device-photo-note, .local-photo-label, .creator-line, .readonly-label { color: var(--muted); font-size: .72rem !important; }.local-photo-label { color: #d7e6a6 !important; }.readonly-label { padding: 8px 0; font-weight: 700; }.auth-gate { min-height: calc(100vh - 150px); display: grid; place-items: center; }.auth-gate .empty-state { max-width: 620px; width: 100%; }.auth-gate h1 { margin: 6px 0 10px; }
+.auth-error { margin: 14px 0; text-align: left; overflow-wrap: anywhere; }
 .auth-checking { color: var(--muted); font-size: .82rem; font-weight: 700; }
 .computer-card-body { min-width: 0; flex: 1; }.computer-card-body strong, .computer-card-body span, .computer-card-body small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.computer-card-body .badge { width: fit-content; }.computer-card-body span, .computer-card-body small { color: var(--muted); }.computer-card-body small { margin-top: 4px; }.chevron { font-size: 1.9rem; color: #869992; padding: 0 8px; }
 
