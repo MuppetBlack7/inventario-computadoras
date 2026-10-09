@@ -6,6 +6,10 @@
       "destination": "https://inventario-computadoras-rc26.firebaseapp.com/__/auth/:path*"
     },
     {
+      "source": "/__/firebase/:path*",
+      "destination": "https://inventario-computadoras-rc26.firebaseapp.com/__/firebase/:path*"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
