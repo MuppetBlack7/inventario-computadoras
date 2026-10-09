@@ -28,7 +28,10 @@ export default defineConfig({
       workbox: {
         globPatterns: ['**/*.{js,css,html,png,svg,woff2}'],
         cleanupOutdatedCaches: true,
-        navigateFallback: 'index.html'
+        navigateFallback: 'index.html',
+        // Firebase Auth must reach Vercel's proxy; never answer OAuth routes
+        // from the SPA cache, including in an installed iOS PWA.
+        navigateFallbackDenylist: [/^\/__\/auth\//, /^\/__\/firebase\//]
       },
       devOptions: { enabled: true }
     })

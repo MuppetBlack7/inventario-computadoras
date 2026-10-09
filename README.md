@@ -83,7 +83,7 @@ VITE_FIREBASE_STORAGE_ENABLED
 VITE_IMAGEKIT_BACKEND_URL
 ```
 
-En Vercel, `VITE_FIREBASE_AUTH_DOMAIN` debe ser `inventario-computadoras-rc26.firebaseapp.com`. El retorno de `signInWithRedirect` se sirve desde el handler oficial de Firebase y evita que el fallback SPA de Vercel intercepte OAuth. El dominio de Vercel permanece en **Firebase Authentication → Settings → Authorized domains**. La clave privada de ImageKit permanece exclusivamente en el secreto `IMAGEKIT_PRIVATE_KEY` del Worker; nunca es una variable de Vercel.
+En Vercel, `VITE_FIREBASE_AUTH_DOMAIN_OVERRIDE` debe ser el dominio de producción de Vercel. `vercel.json` proxy `/__/auth/*` y `/__/firebase/*` al handler oficial de Firebase; el Service Worker excluye esas rutas del fallback SPA para conservar el retorno OAuth en Safari y PWA. Ese dominio debe estar en **Firebase Authentication → Settings → Authorized domains** y su URL `/__/auth/handler` en los URI de redirección autorizados del cliente OAuth de Google. La clave privada de ImageKit permanece exclusivamente en el secreto `IMAGEKIT_PRIVATE_KEY` del Worker; nunca es una variable de Vercel.
 
 Despliegue manual:
 
