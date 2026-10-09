@@ -16,9 +16,9 @@ import { isAppleMobilePlatform } from './authPlatform'
 
 const config: FirebaseOptions = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  // Vercel production can use its custom domain as the Auth redirect handler
-  // without changing the Firebase Hosting configuration used for local checks.
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN_OVERRIDE || import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  // El retorno OAuth se sirve desde el dominio oficial de Firebase. Esto evita
+  // que una ruta de Vercel o el fallback SPA capture el handler de Auth.
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
   projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
   storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
   messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
