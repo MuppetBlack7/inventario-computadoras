@@ -22,6 +22,8 @@ import { displayEquipmentType, driveSummary, emptyComputer, formatDateTime, uid 
 const BackupView = lazy(() => import('./components/BackupView').then((module) => ({ default: module.BackupView })))
 const ScannerView = lazy(() => import('./components/ScannerView').then((module) => ({ default: module.ScannerView })))
 
+const PAGE_SIZE = 50
+
 const creatorFields = (user: User) => ({ ownerId: user.uid, ownerName: user.displayName || '', ownerEmail: user.email || '' })
 
 type View =
@@ -276,7 +278,7 @@ export default function App() {
               setView({ name: 'inventory', sessionId })
             }}
           />}
-          {view.name === 'backup' && <Suspense fallback={<LoadingPanel label="Abriendo herramientas de respaldo…" />}><BackupView sessions={sessions} ownerId={user.uid} onChanged={() => void afterLocalChange()} /></Suspense>}
+          {view.name === 'backup' && <Suspense fallback={<LoadingPanel label="Abriendo herramientas de respaldo…" />}><BackupView sessions={sessions} computers={computers} ownerId={user.uid} onChanged={() => void afterLocalChange()} /></Suspense>}
         </>
       )}
 
@@ -471,11 +473,18 @@ interface InventoryProps {
 
 function InventoryScreen({ session, computers, onBack, onScan, onAdd, onOpen }: InventoryProps) {
   const [query, setQuery] = useState('')
+  const [debounced, setDebounced] = useState('')
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
+  useEffect(() => {
+    const timer = window.setTimeout(() => { setDebounced(query); setVisibleCount(PAGE_SIZE) }, 250)
+    return () => window.clearTimeout(timer)
+  }, [query])
   const filtered = useMemo(() => {
-    const term = query.trim().toLocaleLowerCase('es-MX')
+    const term = debounced.trim().toLocaleLowerCase('es-MX')
     if (!term) return computers
     return computers.filter((computer) => [displayEquipmentType(computer), computer.serialNumber, computer.inventoryId, computer.brand, computer.model].join(' ').toLocaleLowerCase('es-MX').includes(term))
-  }, [computers, query])
+  }, [computers, debounced])
+  const shown = filtered.slice(0, visibleCount)
 
   if (!session) return <main className="screen"><p>La sesión ya no existe.</p><button onClick={onBack}>Volver</button></main>
   return (
@@ -492,7 +501,7 @@ function InventoryScreen({ session, computers, onBack, onScan, onAdd, onOpen }: 
         <button className="secondary-button" onClick={onAdd}>+ Manual</button>
       </div>
       {filtered.length ? <div className="computer-list">
-        {filtered.map((computer) => <button className="computer-card" key={computer.id} onClick={() => onOpen(computer.id)}>
+        {shown.map((computer) => <button className="computer-card" key={computer.id} onClick={() => onOpen(computer.id)}>
           <PhotoPreview blob={computer.photo} remote={computer.photoRemote} computerId={computer.cloudId || computer.id} thumbnail alt={`Foto de ${computer.inventoryId}`} className="computer-thumb" unavailableOnDevice={!computer.photo && Boolean(computer.photoStoredLocally || computer.photoPath)} />
           <div className="computer-card-body">
             {computer.isExample && <span className="badge">EJEMPLO</span>}
@@ -505,6 +514,7 @@ function InventoryScreen({ session, computers, onBack, onScan, onAdd, onOpen }: 
           </div>
           <span className="chevron">›</span>
         </button>)}
+        {filtered.length > shown.length && <button className="secondary-button" onClick={() => setVisibleCount((count) => count + PAGE_SIZE)}>Mostrar más ({filtered.length - shown.length} restantes)</button>}
       </div> : <section className="empty-state compact-empty"><h2>{query ? 'Sin coincidencias' : 'Aún no hay equipos'}</h2><p>{query ? 'Prueba otra búsqueda.' : 'Escanea un código o registra uno manualmente.'}</p>{!query && <button className="primary-button" onClick={onScan}>Escanear primer equipo</button>}</section>}
     </main>
   )

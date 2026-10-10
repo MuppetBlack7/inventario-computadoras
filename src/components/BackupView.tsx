@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import QRCode from 'qrcode'
-import type { InventoryBackup, InventorySession } from '../types'
+import type { ComputerRecord, InventoryBackup, InventorySession } from '../types'
 import { downloadBackup, readBackupFile, restoreBackup } from '../backup'
 import { exportInventoryToExcel } from '../exportExcel'
 import { TEST_QR_DATA } from '../sampleData'
@@ -10,11 +10,12 @@ import { imageKitConfigured } from '../imageKitClient'
 
 interface Props {
   sessions: InventorySession[]
+  computers: ComputerRecord[]
   ownerId: string | null
   onChanged: () => void
 }
 
-export function BackupView({ sessions, ownerId, onChanged }: Props) {
+export function BackupView({ sessions, computers, ownerId, onChanged }: Props) {
   const [selectedSession, setSelectedSession] = useState('all')
   const [status, setStatus] = useState('Listo')
   const [backup, setBackup] = useState<InventoryBackup | null>(null)
@@ -29,7 +30,7 @@ export function BackupView({ sessions, ownerId, onChanged }: Props) {
   const exportExcel = async () => {
     setStatus('Generando Excel con miniaturas…')
     try {
-      const result = await exportInventoryToExcel(selectedSession === 'all' ? undefined : selectedSession, ownerId)
+      const result = await exportInventoryToExcel(selectedSession === 'all' ? undefined : selectedSession, ownerId, { sessions, computers })
       setStatus(`Exportado: ${result.rows} equipo${result.rows === 1 ? '' : 's'} en ${result.filename}`)
     } catch (error) {
       setStatus(error instanceof Error ? `Error al exportar: ${error.message}` : 'Error al exportar')

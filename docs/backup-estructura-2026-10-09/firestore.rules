@@ -1,0 +1,102 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function owns(data) {
+      return signedIn() && data.ownerId is string && data.ownerId == request.auth.uid;
+    }
+
+    function validSession(data, sessionId) {
+      return data.ownerId is string
+        && data.ownerName is string
+        && data.ownerEmail is string
+        && data.id == sessionId
+        && data.cloudId == sessionId
+        && data.name is string
+        && data.name.size() > 0
+        && data.date is string
+        && data.location is string
+        && data.createdAt is string
+        && data.updatedAt is string;
+    }
+
+    function validComputer(data, computerId) {
+      return data.ownerId is string
+        && data.ownerName is string
+        && data.ownerEmail is string
+        && data.id == computerId
+        && data.cloudId == computerId
+        && data.sessionId is string
+        && data.equipmentType is string
+        && data.inventoryId is string
+        && data.inventoryNormalized is string
+        && data.serialNumber is string
+        && data.serialNormalized is string
+        && data.brand is string
+        && data.model is string
+        && data.yearUnknown is bool
+        && data.operatingSystem is string
+        && data.drives is list
+        && data.originalCode is string
+        && data.scannedAt is string
+        && data.timezone is string
+        && data.writtenLocation is string
+        && data.notes is string
+        && data.createdAt is string
+        && data.updatedAt is string
+        && validPhotoReference(data);
+    }
+
+    function validPhotoReference(data) {
+      return !('photoRemote' in data) || (
+        data.photoRemote is map
+        && data.photoRemote.fileId is string
+        && data.photoRemote.fileId.size() > 0
+        && data.photoRemote.url is string
+        && data.photoRemote.url.matches('https://.*')
+        && data.photoRemote.filePath is string
+        && data.photoRemote.name is string
+        && data.photoRemote.size is int
+        && (data.photoRemote.width == null || data.photoRemote.width is number)
+        && (data.photoRemote.height == null || data.photoRemote.height is number)
+        && data.photoRemote.mimeType is string
+        && data.photoRemote.uploadedAt is string
+      );
+    }
+
+    match /inventorySessions/{sessionId} {
+      allow read: if signedIn();
+      allow create: if owns(request.resource.data) && validSession(request.resource.data, sessionId);
+      allow update: if owns(resource.data)
+        && request.resource.data.ownerId == resource.data.ownerId
+        && validSession(request.resource.data, sessionId);
+      allow delete: if owns(resource.data);
+    }
+
+    match /inventoryComputers/{computerId} {
+      allow read: if signedIn();
+      allow create: if owns(request.resource.data) && validComputer(request.resource.data, computerId);
+      allow update: if owns(resource.data)
+        && request.resource.data.ownerId == resource.data.ownerId
+        && validComputer(request.resource.data, computerId);
+      allow delete: if owns(resource.data);
+    }
+
+    // Rutas privadas anteriores: se conservan para migrar sin borrar datos.
+    match /users/{userId}/sessions/{sessionId} {
+      allow read, write: if signedIn() && request.auth.uid == userId;
+    }
+
+    match /users/{userId}/computers/{computerId} {
+      allow read, write: if signedIn() && request.auth.uid == userId;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

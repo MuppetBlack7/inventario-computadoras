@@ -1,5 +1,6 @@
 import ExcelJS from 'exceljs'
 import { listVisibleComputers, listVisibleSessions } from './db'
+import type { ComputerRecord, InventorySession } from './types'
 import { displayEquipmentType, downloadBlob, driveSummary, photoToDataUrl } from './utils'
 import { downloadRemotePhoto } from './imageKitClient'
 
@@ -16,8 +17,16 @@ export const INVENTORY_EXCEL_HEADERS = [
   'Sistema operativo'
 ] as const
 
-export async function buildInventoryWorkbook(sessionId?: string, ownerId: string | null = null) {
-  const [sessions, computers] = await Promise.all([listVisibleSessions(ownerId), listVisibleComputers(ownerId, sessionId)])
+export interface LoadedInventory {
+  sessions: InventorySession[]
+  computers: ComputerRecord[]
+}
+
+/** Si se pasa `loaded` (datos ya cargados en pantalla) no se vuelve a leer la base local; Excel nunca consulta Firestore. */
+export async function buildInventoryWorkbook(sessionId?: string, ownerId: string | null = null, loaded?: LoadedInventory) {
+  const [sessions, computers] = loaded
+    ? [loaded.sessions, sessionId ? loaded.computers.filter((computer) => computer.sessionId === sessionId) : loaded.computers]
+    : await Promise.all([listVisibleSessions(ownerId), listVisibleComputers(ownerId, sessionId)])
   const sessionMap = new Map(sessions.map((session) => [session.id, session]))
   const workbook = new ExcelJS.Workbook()
   workbook.creator = 'Inventario de computadoras PWA'
@@ -79,8 +88,8 @@ export async function buildInventoryWorkbook(sessionId?: string, ownerId: string
   return { buffer, rows: computers.length, filename }
 }
 
-export async function exportInventoryToExcel(sessionId?: string, ownerId: string | null = null) {
-  const result = await buildInventoryWorkbook(sessionId, ownerId)
+export async function exportInventoryToExcel(sessionId?: string, ownerId: string | null = null, loaded?: LoadedInventory) {
+  const result = await buildInventoryWorkbook(sessionId, ownerId, loaded)
   downloadBlob(new Blob([result.buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), result.filename)
   return { rows: result.rows, filename: result.filename }
 }

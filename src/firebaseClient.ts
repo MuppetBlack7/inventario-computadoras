@@ -10,7 +10,7 @@ import {
   signInWithRedirect,
   type User
 } from 'firebase/auth'
-import { getFirestore } from 'firebase/firestore'
+import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, type Firestore } from 'firebase/firestore'
 import { getStorage } from 'firebase/storage'
 import { isAppleMobilePlatform } from './authPlatform'
 
@@ -32,7 +32,16 @@ const app = firebaseConfigured ? (getApps().length ? getApp() : initializeApp(co
 // IndexedDB/local-storage fallback. configureAuthPersistence below enforces it
 // before redirect sign-in and before handling its result.
 export const firebaseAuth = app ? getAuth(app) : null
-export const firestore = app ? getFirestore(app) : null
+// Caché persistente de Firestore (IndexedDB, varias pestañas) para lecturas offline y menos tráfico.
+const createFirestore = (): Firestore | null => {
+  if (!app) return null
+  try {
+    return initializeFirestore(app, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) })
+  } catch {
+    return getFirestore(app)
+  }
+}
+export const firestore = createFirestore()
 export const firebaseStorage = app && storageEnabled ? getStorage(app) : null
 
 let persistencePromise: Promise<void> | undefined

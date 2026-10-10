@@ -1,4 +1,4 @@
-import { collection, deleteDoc, doc, getDoc, getDocs, limit, query, setDoc, where } from 'firebase/firestore'
+import { collection, deleteDoc, doc, getCountFromServer, getDoc, getDocs, limit, orderBy, query, setDoc, startAfter, where, type QueryConstraint, type QueryDocumentSnapshot } from 'firebase/firestore'
 import {
   deleteComputer,
   deleteLocalSession,
@@ -203,6 +203,8 @@ export async function synchronize(ownerId: string, report: SyncReporter = () => 
 
 export async function migrateLegacyCloudData(identity: CreatorIdentity) {
   if (!firestore || !navigator.onLine) return { sessions: 0, computers: 0 }
+  // La ruta privada anterior solo se migra una vez por dispositivo y cuenta (evita 2 lecturas completas en cada inicio).
+  if (readMeta(`inventario.legacy.${identity.uid}`) === 'done') return { sessions: 0, computers: 0 }
   const [legacySessions, legacyComputers] = await Promise.all([
     getDocs(collection(firestore, 'users', identity.uid, 'sessions')),
     getDocs(collection(firestore, 'users', identity.uid, 'computers'))
@@ -229,25 +231,111 @@ export async function migrateLegacyCloudData(identity: CreatorIdentity) {
       computers += 1
     }
   }
+  writeMeta(`inventario.legacy.${identity.uid}`, 'done')
   return { sessions, computers }
 }
 
-export async function pullCloudData(_ownerId: string) {
-  if (!firestore || !navigator.onLine) return { sessions: 0, computers: 0 }
-  const [remoteSessions, remoteComputers, localSessions, localComputers] = await Promise.all([
-    getDocs(collection(firestore, SHARED_SESSIONS)),
-    getDocs(collection(firestore, SHARED_COMPUTERS)),
-    listSessions(),
-    listComputers()
-  ])
+const PULL_PAGE_SIZE = 200
+const OVERLAP_MS = 10 * 60 * 1000
+const FULL_RECONCILE_MIN_INTERVAL_MS = 10 * 60 * 1000
+
+const memoryMeta = new Map<string, string>()
+const readMeta = (key: string) => {
+  try { return localStorage.getItem(key) ?? memoryMeta.get(key) ?? null } catch { return memoryMeta.get(key) ?? null }
+}
+const writeMeta = (key: string, value: string) => {
+  memoryMeta.set(key, value)
+  try { localStorage.setItem(key, value) } catch { /* el almacenamiento puede estar bloqueado */ }
+}
+
+export const PULL_META_PREFIX = 'inventario.pull.'
+const cursorKey = (name: string) => `${PULL_META_PREFIX}${name}.cursor`
+const reconcileKey = (name: string) => `${PULL_META_PREFIX}${name}.reconciledAt`
+
+export interface PullStats {
+  sessions: number
+  computers: number
+  reads: number
+}
+
+/** Descarga una colección por páginas ordenadas por updatedAt. Con `since` solo trae lo modificado. */
+async function fetchPages(name: string, since?: string) {
+  if (!firestore) return []
+  const base = collection(firestore, name)
+  const docs: QueryDocumentSnapshot[] = []
+  let last: QueryDocumentSnapshot | undefined
+  for (;;) {
+    const constraints: QueryConstraint[] = []
+    if (since) constraints.push(where('updatedAt', '>=', since))
+    constraints.push(orderBy('updatedAt'))
+    if (last) constraints.push(startAfter(last))
+    constraints.push(limit(PULL_PAGE_SIZE))
+    const page = await getDocs(query(base, ...constraints))
+    docs.push(...page.docs)
+    if (page.docs.length < PULL_PAGE_SIZE) break
+    last = page.docs[page.docs.length - 1]
+  }
+  return docs
+}
+
+async function loadRemote(name: string, localSharedCount: number, pendingDeleteCount: number, force: boolean) {
+  const cursor = readMeta(cursorKey(name))
+  const lastFull = Number(readMeta(reconcileKey(name)) || 0)
+  const stale = Date.now() - lastFull > FULL_RECONCILE_MIN_INTERVAL_MS
+  let full = force || !cursor
+  let docs: QueryDocumentSnapshot[] = []
+  let reads = 0
+  if (!full) {
+    docs = await fetchPages(name, new Date(Date.parse(cursor!) - OVERLAP_MS).toISOString())
+    reads += docs.length
+    if (stale && firestore) {
+      // Detecta borrados remotos con una consulta de conteo (1 lectura por cada 1000 documentos) en vez de releer todo.
+      const remoteCount = (await getCountFromServer(collection(firestore, name))).data().count
+      reads += 1
+      if (remoteCount !== localSharedCount + pendingDeleteCount) full = true
+      else writeMeta(reconcileKey(name), String(Date.now()))
+    }
+  }
+  if (full) {
+    docs = await fetchPages(name)
+    reads += docs.length
+    writeMeta(reconcileKey(name), String(Date.now()))
+  }
+  const newest = docs.reduce((max, entry) => {
+    const value = String(entry.data().updatedAt || '')
+    return value > max ? value : max
+  }, cursor || '')
+  if (newest) writeMeta(cursorKey(name), newest)
+  return { docs, full, reads }
+}
+
+let pullInFlight: Promise<PullStats> | undefined
+
+/**
+ * Sincroniza hacia el dispositivo solo los documentos nuevos o modificados (paginado, orderBy + limit + startAfter).
+ * Las llamadas simultáneas comparten la misma consulta. `force` hace una reconciliación completa.
+ */
+export function pullCloudData(_ownerId: string, options: { force?: boolean } = {}): Promise<PullStats> {
+  if (!firestore || !navigator.onLine) return Promise.resolve({ sessions: 0, computers: 0, reads: 0 })
+  if (!pullInFlight) pullInFlight = runPull(Boolean(options.force)).finally(() => { pullInFlight = undefined })
+  return pullInFlight
+}
+
+async function runPull(force: boolean): Promise<PullStats> {
+  const [localSessions, localComputers, queue] = await Promise.all([listSessions(), listComputers(), getPendingSyncQueue()])
   // Borrados pendientes: no se vuelven a descargar mientras Firestore no los confirme.
-  const pendingDeletes = (await getPendingSyncQueue()).filter((item) => item.operation.startsWith('delete-'))
+  const pendingDeletes = queue.filter((item) => item.operation.startsWith('delete-'))
   const deletedSessions = new Set(pendingDeletes.filter((item) => item.operation === 'delete-session').flatMap((item) => [item.entityId, item.remoteId]))
   const deletedComputers = new Set(pendingDeletes.filter((item) => item.operation === 'delete-computer').flatMap((item) => [item.entityId, item.remoteId]))
-  const sessionIds = new Set(remoteSessions.docs.map((entry) => entry.id))
-  const computerIds = new Set(remoteComputers.docs.map((entry) => entry.id))
+  const sharedCount = <T extends { sharedCloud?: boolean; cloudId?: string; id: string }>(items: T[]) =>
+    new Set(items.filter((item) => item.sharedCloud).map((item) => item.cloudId || item.id)).size
 
-  for (const snapshot of remoteSessions.docs) {
+  const [sessionsResult, computersResult] = await Promise.all([
+    loadRemote(SHARED_SESSIONS, sharedCount(localSessions), pendingDeletes.filter((item) => item.operation === 'delete-session').length, force),
+    loadRemote(SHARED_COMPUTERS, sharedCount(localComputers), pendingDeletes.filter((item) => item.operation === 'delete-computer').length, force)
+  ])
+
+  for (const snapshot of sessionsResult.docs) {
     if (deletedSessions.has(snapshot.id)) continue
     const remote = snapshot.data() as InventorySession
     const local = localSessions.find((item) => item.cloudId === snapshot.id || item.id === snapshot.id)
@@ -255,19 +343,18 @@ export async function pullCloudData(_ownerId: string) {
     await saveSession({ ...remote, id: local?.id || remote.id || snapshot.id, cloudId: snapshot.id, sharedCloud: true, syncStatus: 'synced', syncError: undefined }, false)
   }
 
-  for (const snapshot of remoteComputers.docs) {
+  for (const snapshot of computersResult.docs) {
     if (deletedComputers.has(snapshot.id)) continue
     const remote = snapshot.data() as ComputerRecord
     const local = localComputers.find((item) => item.cloudId === snapshot.id || item.id === snapshot.id)
     if (local && local.syncStatus && local.syncStatus !== 'synced' && local.ownerId === remote.ownerId) continue
-    const photo = local?.photo
     await saveComputer({
       ...remote,
       equipmentType: remote.equipmentType || '',
       id: local?.id || remote.id || snapshot.id,
       cloudId: snapshot.id,
       sharedCloud: true,
-      photo,
+      photo: local?.photo,
       photoNeedsUpload: local?.photoNeedsUpload,
       photoUploadStatus: remote.photoRemote ? 'uploaded' : local?.photoUploadStatus,
       photoUploadError: local?.photoUploadError,
@@ -276,13 +363,20 @@ export async function pullCloudData(_ownerId: string) {
     }, false)
   }
 
-  for (const computer of localComputers.filter((item) => item.sharedCloud && item.syncStatus === 'synced' && !computerIds.has(item.cloudId || item.id))) {
-    await deleteComputer(computer.id, computer.ownerId, false)
+  // Solo una descarga completa permite saber qué documentos desaparecieron de Firestore.
+  if (computersResult.full) {
+    const ids = new Set(computersResult.docs.map((entry) => entry.id))
+    for (const computer of localComputers.filter((item) => item.sharedCloud && item.syncStatus === 'synced' && !ids.has(item.cloudId || item.id))) {
+      await deleteComputer(computer.id, computer.ownerId, false)
+    }
   }
-  for (const session of localSessions.filter((item) => item.sharedCloud && item.syncStatus === 'synced' && !sessionIds.has(item.cloudId || item.id))) {
-    await deleteLocalSession(session.id)
+  if (sessionsResult.full) {
+    const ids = new Set(sessionsResult.docs.map((entry) => entry.id))
+    for (const session of localSessions.filter((item) => item.sharedCloud && item.syncStatus === 'synced' && !ids.has(item.cloudId || item.id))) {
+      await deleteLocalSession(session.id)
+    }
   }
-  return { sessions: remoteSessions.size, computers: remoteComputers.size }
+  return { sessions: sessionsResult.docs.length, computers: computersResult.docs.length, reads: sessionsResult.reads + computersResult.reads }
 }
 
 export async function verifyCloudOwnership(ownerId: string) {

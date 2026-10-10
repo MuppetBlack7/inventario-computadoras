@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { getSignedPhotoUrl, imageKitConfigured } from '../imageKitClient'
 import type { ImageKitPhotoReference } from '../types'
 
@@ -15,6 +15,15 @@ interface Props {
 export function PhotoPreview({ blob, alt, className, unavailableOnDevice = false, computerId, remote, thumbnail = false }: Props) {
   const [url, setUrl] = useState('')
   const [remoteState, setRemoteState] = useState<'idle' | 'loading' | 'error'>('idle')
+  const holder = useRef<HTMLDivElement>(null)
+  const [visible, setVisible] = useState(typeof IntersectionObserver === 'undefined')
+  // Carga progresiva: la URL firmada solo se pide cuando la foto entra en pantalla.
+  useEffect(() => {
+    if (visible || !holder.current) return
+    const observer = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) { setVisible(true); observer.disconnect() } }, { rootMargin: '200px' })
+    observer.observe(holder.current)
+    return () => observer.disconnect()
+  }, [visible])
   useEffect(() => {
     let active = true
     if (blob) {
@@ -24,16 +33,16 @@ export function PhotoPreview({ blob, alt, className, unavailableOnDevice = false
       return () => { active = false; URL.revokeObjectURL(nextUrl) }
     }
     setUrl('')
-    if (!remote || !computerId || !imageKitConfigured) return () => { active = false }
+    if (!remote || !computerId || !imageKitConfigured || !visible) return () => { active = false }
     setRemoteState('loading')
     void getSignedPhotoUrl(computerId, remote, thumbnail)
       .then((nextUrl) => { if (active) { setUrl(nextUrl); setRemoteState('idle') } })
       .catch(() => { if (active) setRemoteState('error') })
     return () => { active = false }
-  }, [blob, computerId, remote, thumbnail])
+  }, [blob, computerId, remote, thumbnail, visible])
 
   if (!url) {
-    const message = remoteState === 'loading'
+    const message = remoteState === 'loading' || (remote && !visible && imageKitConfigured)
       ? 'Cargando fotografía protegida…'
       : remoteState === 'error'
         ? 'Error al cargar la fotografía'
@@ -42,7 +51,7 @@ export function PhotoPreview({ blob, alt, className, unavailableOnDevice = false
           : unavailableOnDevice
             ? 'Fotografía no disponible en este dispositivo'
             : 'Sin fotografía'
-    return <div className={`photo-placeholder ${className || ''}`} aria-label={message}><b>⌁</b><span>{message}</span></div>
+    return <div ref={holder} className={`photo-placeholder ${className || ''}`} aria-label={message}><b>⌁</b><span>{message}</span></div>
   }
   return <img className={className} src={url} alt={alt} />
 }
