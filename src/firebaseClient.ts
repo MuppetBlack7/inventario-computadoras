@@ -78,7 +78,8 @@ export async function signInWithGoogle() {
   const provider = new GoogleAuthProvider()
   provider.setCustomParameters({ prompt: 'select_account' })
   const isIOS = isAppleMobilePlatform(navigator)
-  if (isIOS) {
+  const isLocalDevelopment = ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname)
+  if (isIOS || isLocalDevelopment) {
     await signInWithRedirect(firebaseAuth, provider)
     return
   }
@@ -86,7 +87,7 @@ export async function signInWithGoogle() {
     await signInWithPopup(firebaseAuth, provider)
   } catch (error) {
     const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : ''
-    if (['auth/popup-blocked', 'auth/cancelled-popup-request', 'auth/operation-not-supported-in-this-environment'].includes(code)) {
+    if (['auth/popup-blocked', 'auth/popup-closed-by-user', 'auth/cancelled-popup-request', 'auth/operation-not-supported-in-this-environment'].includes(code)) {
       await signInWithRedirect(firebaseAuth, provider)
       return
     }

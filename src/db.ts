@@ -82,8 +82,9 @@ export async function deleteSessionAndComputers(sessionId: string, ownerId?: str
   const computerKeys = await transaction.objectStore('computers').index('by-session').getAllKeys(sessionId)
   await Promise.all(computerKeys.map((key) => transaction.objectStore('computers').delete(key)))
   if (enqueue) {
-    await transaction.objectStore('syncQueue').put(queueItem('delete-session', sessionId, ownerId, existingSession?.cloudId))
     for (const computer of existingComputers) await transaction.objectStore('syncQueue').put(queueItem('delete-computer', computer.id, ownerId, computer.cloudId, computer.photoRemote?.fileId))
+    // Los equipos se eliminan antes que la sesión remota para no dejar registros huérfanos si se interrumpe la sincronización.
+    await transaction.objectStore('syncQueue').put(queueItem('delete-session', sessionId, ownerId, existingSession?.cloudId))
   }
   await transaction.done
 }

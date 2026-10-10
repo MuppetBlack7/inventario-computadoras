@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dev-dist/
 functions/
 .firebase/
 worker/node_modules/

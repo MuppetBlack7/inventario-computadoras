@@ -30,6 +30,7 @@ export const emptyComputer = (sessionId: string): ComputerRecord => {
     sessionId,
     inventoryId: '',
     equipmentType: '',
+    customEquipmentType: '',
     inventoryNormalized: '',
     serialNumber: '',
     serialNormalized: '',
@@ -52,6 +53,11 @@ export const emptyComputer = (sessionId: string): ComputerRecord => {
     updatedAt: stamp.iso
   }
 }
+
+export const displayEquipmentType = (computer: Pick<ComputerRecord, 'equipmentType' | 'customEquipmentType'>) =>
+  computer.equipmentType === 'Otro'
+    ? computer.customEquipmentType?.trim() || ''
+    : computer.equipmentType || ''
 
 export const photoToDataUrl = async (blob: Blob) => {
   const bytes = new Uint8Array(await blob.arrayBuffer())

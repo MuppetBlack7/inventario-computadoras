@@ -6,6 +6,7 @@ import { buildInventoryWorkbook, INVENTORY_EXCEL_HEADERS } from './exportExcel'
 import {
   clearAllData,
   claimLocalData,
+  deleteSessionAndComputers,
   findDuplicates,
   getPendingSyncQueue,
   listComputers,
@@ -19,7 +20,7 @@ import {
 import { parseScannedCode } from './qr'
 import { pendingCount } from './cloudSync'
 import type { ComputerRecord, InventorySession } from './types'
-import { normalizeKey } from './utils'
+import { displayEquipmentType, normalizeKey } from './utils'
 import { isAppleMobilePlatform } from './authPlatform'
 import { describeFirebaseAuthError } from './firebaseClient'
 
@@ -70,6 +71,27 @@ describe('inventario local', () => {
     expect(await findDuplicates('inv 001', '')).toHaveLength(1)
     expect(await findDuplicates('', 'sn_001')).toHaveLength(1)
     expect(await findDuplicates('otro', 'otra')).toHaveLength(0)
+  })
+
+  it('guarda, limpia y muestra un tipo de equipo personalizado', async () => {
+    await saveSession(session)
+    await saveComputer({ ...computer, equipmentType: 'Otro', customEquipmentType: 'Servidor' })
+    let stored = (await listComputers())[0]
+    expect(displayEquipmentType(stored)).toBe('Servidor')
+    await saveComputer({ ...stored, equipmentType: '', customEquipmentType: '' })
+    stored = (await listComputers())[0]
+    expect(displayEquipmentType(stored)).toBe('')
+  })
+
+  it('elimina una sesión, sus equipos y deja operaciones de borrado para sincronizar', async () => {
+    await saveSession({ ...session, cloudId: 'remote-session' })
+    await saveComputer({ ...computer, cloudId: 'remote-computer', photoRemote: { fileId: 'file-1', url: 'https://example.com/foto.jpg', filePath: '/foto.jpg', name: 'foto.jpg', size: 4, width: null, height: null, mimeType: 'image/jpeg', uploadedAt: '2026-10-09T12:00:00.000Z' } })
+    await deleteSessionAndComputers(session.id, 'alice')
+    expect(await listSessions()).toHaveLength(0)
+    expect(await listComputers()).toHaveLength(0)
+    const pending = await getPendingSyncQueue()
+    expect(pending.map((item) => item.operation).sort()).toEqual(['delete-computer', 'delete-session'])
+    expect(pending.find((item) => item.operation === 'delete-computer')).toMatchObject({ remoteId: 'remote-computer', photoFileId: 'file-1' })
   })
 
   it('muestra el inventario local compartido al iniciar sesión y aísla la cola offline por creador', async () => {
@@ -128,7 +150,7 @@ describe('inventario local', () => {
 
   it('genera un Excel válido con todos los registros y miniatura', async () => {
     await saveSession(session)
-    await saveComputer(computer)
+    await saveComputer({ ...computer, equipmentType: 'Otro', customEquipmentType: 'Servidor' })
     const result = await buildInventoryWorkbook(undefined, 'alice')
     expect(result.rows).toBe(1)
     expect(result.filename.endsWith('.xlsx')).toBe(true)
@@ -142,5 +164,6 @@ describe('inventario local', () => {
     expect(worksheet.getImages()).toHaveLength(1)
     expect(worksheet.getCell('F2').value).toBe('16 GB')
     expect(worksheet.getCell('G2').value).toContain('SSD: 512 GB')
+    expect(worksheet.getCell('A2').value).toBe('Servidor')
   })
 })

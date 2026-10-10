@@ -17,7 +17,7 @@ import { migrateLegacyCloudData, pendingCount, pullCloudData, synchronize, verif
 import { describeFirebaseAuthError, firebaseAuth, firebaseConfigured, prepareFirebaseAuth, signInWithGoogle } from './firebaseClient'
 import { imageKitConfigured } from './imageKitClient'
 import type { ComputerRecord, InventorySession, SyncStatus } from './types'
-import { driveSummary, emptyComputer, formatDateTime, uid } from './utils'
+import { displayEquipmentType, driveSummary, emptyComputer, formatDateTime, uid } from './utils'
 
 const BackupView = lazy(() => import('./components/BackupView').then((module) => ({ default: module.BackupView })))
 const ScannerView = lazy(() => import('./components/ScannerView').then((module) => ({ default: module.ScannerView })))
@@ -474,7 +474,7 @@ function InventoryScreen({ session, computers, onBack, onScan, onAdd, onOpen }: 
   const filtered = useMemo(() => {
     const term = query.trim().toLocaleLowerCase('es-MX')
     if (!term) return computers
-    return computers.filter((computer) => [computer.equipmentType, computer.serialNumber, computer.inventoryId, computer.brand, computer.model].join(' ').toLocaleLowerCase('es-MX').includes(term))
+    return computers.filter((computer) => [displayEquipmentType(computer), computer.serialNumber, computer.inventoryId, computer.brand, computer.model].join(' ').toLocaleLowerCase('es-MX').includes(term))
   }, [computers, query])
 
   if (!session) return <main className="screen"><p>La sesión ya no existe.</p><button onClick={onBack}>Volver</button></main>
@@ -497,7 +497,7 @@ function InventoryScreen({ session, computers, onBack, onScan, onAdd, onOpen }: 
           <div className="computer-card-body">
             {computer.isExample && <span className="badge">EJEMPLO</span>}
             <SyncBadge status={computer.syncStatus} />
-            <strong>{computer.equipmentType || 'Tipo no indicado'}</strong>
+            <strong>{displayEquipmentType(computer) || 'Tipo no indicado'}</strong>
             <span>{computer.brand || 'Marca pendiente'} {computer.model}</span>
             <small>Inventario: {computer.inventoryId || 'pendiente'} · Serie: {computer.serialNumber || 'pendiente'}</small>
             {computer.photoNeedsUpload && <small className="local-photo-label">Foto local · pendiente de subir</small>}
@@ -535,12 +535,12 @@ function DetailScreen({ computer, session, onBack, onEdit, onDeleted, currentUse
       </div>
       <section className="detail-hero">
         <PhotoPreview blob={computer.photo} remote={computer.photoRemote} computerId={computer.cloudId || computer.id} alt="Fotografía del equipo" className="detail-photo" unavailableOnDevice={!computer.photo && Boolean(computer.photoStoredLocally || computer.photoPath)} />
-        <div><span className="badge">{computer.isExample ? 'DATO DE EJEMPLO' : 'REGISTRO'}</span><SyncBadge status={computer.syncStatus} /><h2>{computer.equipmentType || 'Tipo de equipo no indicado'}</h2><p>{computer.brand || 'Marca no indicada'} {computer.model}</p>{computer.photoNeedsUpload && <p className="local-photo-label">Fotografía local · pendiente de subir</p>}{computer.photoRemote && !computer.photoNeedsUpload && <p className="local-photo-label">Fotografía privada sincronizada</p>}{computer.photoUploadError && <p className="local-photo-label">Error de fotografía: {computer.photoUploadError}</p>}</div>
+        <div><span className="badge">{computer.isExample ? 'DATO DE EJEMPLO' : 'REGISTRO'}</span><SyncBadge status={computer.syncStatus} /><h2>{displayEquipmentType(computer) || 'Tipo de equipo no indicado'}</h2><p>{computer.brand || 'Marca no indicada'} {computer.model}</p>{computer.photoNeedsUpload && <p className="local-photo-label">Fotografía local · pendiente de subir</p>}{computer.photoRemote && !computer.photoNeedsUpload && <p className="local-photo-label">Fotografía privada sincronizada</p>}{computer.photoUploadError && <p className="local-photo-label">Error de fotografía: {computer.photoUploadError}</p>}</div>
       </section>
       <section className="detail-section">
         <div className="section-row"><h2>Información</h2>{canModify ? <button className="ghost-button" onClick={() => onEdit(computer)}>Editar</button> : <span className="readonly-label">Solo el creador puede editar</span>}</div>
         <dl className="detail-grid">
-          <div><dt>Tipo de equipo</dt><dd>{computer.equipmentType || 'No indicado'}</dd></div>
+          <div><dt>Tipo de equipo</dt><dd>{displayEquipmentType(computer) || 'No indicado'}</dd></div>
           <div><dt>Número de inventario</dt><dd>{computer.inventoryId || 'No indicado'}</dd></div>
           <div><dt>Número de serie</dt><dd>{computer.serialNumber || 'No indicado'}</dd></div>
           <div><dt>Año</dt><dd>{computer.yearUnknown ? 'Desconocido' : computer.manufacturingYear}</dd></div>

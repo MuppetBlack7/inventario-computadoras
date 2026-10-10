@@ -43,6 +43,7 @@ export interface ComputerRecord {
   sessionId: string
   inventoryId: string
   equipmentType?: EquipmentType
+  customEquipmentType?: string
   inventoryNormalized: string
   serialNumber: string
   serialNormalized: string

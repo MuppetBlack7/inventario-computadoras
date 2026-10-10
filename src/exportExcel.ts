@@ -1,6 +1,6 @@
 import ExcelJS from 'exceljs'
 import { listVisibleComputers, listVisibleSessions } from './db'
-import { downloadBlob, driveSummary, photoToDataUrl } from './utils'
+import { displayEquipmentType, downloadBlob, driveSummary, photoToDataUrl } from './utils'
 import { downloadRemotePhoto } from './imageKitClient'
 
 const safeName = (value: string) => value.replace(/[\\/:*?"<>|]+/g, '-').slice(0, 50)
@@ -50,7 +50,7 @@ export async function buildInventoryWorkbook(sessionId?: string, ownerId: string
       ? await downloadRemotePhoto(computer.cloudId || computer.id, computer.photoRemote).catch(() => undefined)
       : undefined)
     const row = worksheet.addRow({
-      equipmentType: computer.equipmentType || 'No indicado',
+      equipmentType: displayEquipmentType(computer) || 'No indicado',
       serialNumber: computer.serialNumber,
       model: computer.model,
       inventoryId: computer.inventoryId,

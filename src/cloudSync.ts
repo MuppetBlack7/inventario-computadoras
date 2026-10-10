@@ -57,6 +57,7 @@ const computerPayload = (computer: ComputerRecord, ownerId: string, cloudId: str
   ownerName: computer.ownerName || '',
   ownerEmail: computer.ownerEmail || '',
   equipmentType: computer.equipmentType || '',
+  customEquipmentType: computer.customEquipmentType || '',
   cloudId,
   sharedCloud: undefined,
   photo: undefined,
@@ -138,11 +139,10 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
 
   if (item.operation === 'delete-computer') {
     const remoteId = item.remoteId || item.entityId
-    if (item.photoFileId) {
-      if (!imageKitConfigured) throw new Error('No se puede eliminar la fotografía remota hasta configurar ImageKit')
-      await deleteCurrentImageKitPhoto(remoteId, item.photoFileId)
-    }
     await deleteDoc(doc(firestore, SHARED_COMPUTERS, remoteId))
+    if (item.photoFileId && imageKitConfigured) {
+      await deleteCurrentImageKitPhoto(remoteId, item.photoFileId).catch(() => undefined)
+    }
   }
   await removeSyncQueueItem(item.id)
   return true
@@ -154,7 +154,12 @@ export async function synchronize(ownerId: string, report: SyncReporter = () => 
     report('local', 'Guardado local')
     return { synced: 0, errors: 0, photosLocalOnly: 0 }
   }
-  const queue = (await getPendingSyncQueue()).filter((item) => item.ownerId === ownerId)
+  const queue = (await getPendingSyncQueue())
+    .filter((item) => item.ownerId === ownerId)
+    .sort((left, right) => {
+      const priority = (item: SyncQueueItem) => item.operation === 'delete-computer' ? 0 : item.operation === 'delete-session' ? 1 : 2
+      return priority(left) - priority(right) || left.createdAt.localeCompare(right.createdAt)
+    })
   if (!queue.length) {
     report('synced', 'Sincronizado')
     return { synced: 0, errors: 0, photosLocalOnly: 0 }

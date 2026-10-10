@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { findDuplicates, saveComputer } from '../db'
 import type { ComputerRecord } from '../types'
-import { compressPhoto, driveSummary, formatDateTime, formatNumber, newDrive } from '../utils'
+import { compressPhoto, displayEquipmentType, driveSummary, formatDateTime, formatNumber, newDrive } from '../utils'
 import { PhotoPreview } from './PhotoPreview'
 
 interface Props {
@@ -116,7 +116,7 @@ export function ComputerForm({ initial, sessionName, onCancel, onSaved, onOpenEx
           <PhotoPreview blob={computer.photo} remote={computer.photoRemote} computerId={computer.cloudId || computer.id} alt="Fotografía del equipo" className="preview-photo" unavailableOnDevice={!computer.photo && Boolean(computer.photoStoredLocally || computer.photoPath)} />
           <div className="preview-title">
             <span>{sessionName}</span>
-            <h2>{computer.equipmentType || 'Tipo de equipo no indicado'}</h2>
+            <h2>{displayEquipmentType(computer) || 'Tipo de equipo no indicado'}</h2>
             <p>Número de inventario: {computer.inventoryId || 'No indicado'}</p>
             <p>{computer.brand || 'Marca no indicada'} {computer.model}</p>
           </div>
@@ -175,8 +175,11 @@ export function ComputerForm({ initial, sessionName, onCancel, onSaved, onOpenEx
       <section className="form-section">
         <h2>Identificación</h2>
         <div className="form-grid">
-          <label>Tipo de equipo
-            <select value={computer.equipmentType || ''} onChange={(event) => update('equipmentType', event.target.value as ComputerRecord['equipmentType'])}>
+          <label>Tipo de equipo <span className="muted">(opcional)</span>
+            <select value={computer.equipmentType || ''} onChange={(event) => {
+              const equipmentType = event.target.value as ComputerRecord['equipmentType']
+              setComputer((current) => ({ ...current, equipmentType, customEquipmentType: equipmentType === 'Otro' ? current.customEquipmentType || '' : '' }))
+            }}>
               <option value="">Seleccionar…</option>
               <option>Computadora de escritorio</option>
               <option>Laptop</option>
@@ -184,6 +187,10 @@ export function ComputerForm({ initial, sessionName, onCancel, onSaved, onOpenEx
               <option>Otro</option>
             </select>
           </label>
+          {computer.equipmentType === 'Otro' && <label>Tipo personalizado
+            <input value={computer.customEquipmentType || ''} onChange={(event) => update('customEquipmentType', event.target.value)} placeholder="Ej. impresora, monitor o servidor" />
+          </label>}
+          {(computer.equipmentType || computer.customEquipmentType) && <div className="wide"><button className="text-button" type="button" onClick={() => setComputer((current) => ({ ...current, equipmentType: '', customEquipmentType: '' }))}>Quitar tipo de equipo</button></div>}
           <label>Número de inventario
             <input value={computer.inventoryId} onChange={(event) => update('inventoryId', event.target.value)} autoCapitalize="characters" />
           </label>
