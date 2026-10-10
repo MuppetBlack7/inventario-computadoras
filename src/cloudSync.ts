@@ -134,14 +134,26 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
   }
 
   if (item.operation === 'delete-session') {
-    await deleteDoc(doc(firestore, SHARED_SESSIONS, item.remoteId || item.entityId))
+    const reference = doc(firestore, SHARED_SESSIONS, item.remoteId || item.entityId)
+    // Si nunca llegó a Firestore no hay nada que borrar (las reglas rechazan borrar documentos inexistentes).
+    const existing = await getDoc(reference)
+    if (existing.exists()) {
+      if (existing.data().ownerId !== ownerId) throw new Error('Solo el creador puede eliminar la sesión')
+      await deleteDoc(reference)
+    }
   }
 
   if (item.operation === 'delete-computer') {
     const remoteId = item.remoteId || item.entityId
-    await deleteDoc(doc(firestore, SHARED_COMPUTERS, remoteId))
-    if (item.photoFileId && imageKitConfigured) {
-      await deleteCurrentImageKitPhoto(remoteId, item.photoFileId).catch(() => undefined)
+    const reference = doc(firestore, SHARED_COMPUTERS, remoteId)
+    const existing = await getDoc(reference)
+    if (existing.exists()) {
+      if (existing.data().ownerId !== ownerId) throw new Error('Solo el creador puede eliminar el equipo')
+      await deleteDoc(reference)
+      // Solo se borra en ImageKit la foto de un equipo propio.
+      if (item.photoFileId && imageKitConfigured) {
+        await deleteCurrentImageKitPhoto(remoteId, item.photoFileId).catch(() => undefined)
+      }
     }
   }
   await removeSyncQueueItem(item.id)
@@ -228,10 +240,15 @@ export async function pullCloudData(_ownerId: string) {
     listSessions(),
     listComputers()
   ])
+  // Borrados pendientes: no se vuelven a descargar mientras Firestore no los confirme.
+  const pendingDeletes = (await getPendingSyncQueue()).filter((item) => item.operation.startsWith('delete-'))
+  const deletedSessions = new Set(pendingDeletes.filter((item) => item.operation === 'delete-session').flatMap((item) => [item.entityId, item.remoteId]))
+  const deletedComputers = new Set(pendingDeletes.filter((item) => item.operation === 'delete-computer').flatMap((item) => [item.entityId, item.remoteId]))
   const sessionIds = new Set(remoteSessions.docs.map((entry) => entry.id))
   const computerIds = new Set(remoteComputers.docs.map((entry) => entry.id))
 
   for (const snapshot of remoteSessions.docs) {
+    if (deletedSessions.has(snapshot.id)) continue
     const remote = snapshot.data() as InventorySession
     const local = localSessions.find((item) => item.cloudId === snapshot.id || item.id === snapshot.id)
     if (local && local.syncStatus && local.syncStatus !== 'synced' && local.ownerId === remote.ownerId) continue
@@ -239,6 +256,7 @@ export async function pullCloudData(_ownerId: string) {
   }
 
   for (const snapshot of remoteComputers.docs) {
+    if (deletedComputers.has(snapshot.id)) continue
     const remote = snapshot.data() as ComputerRecord
     const local = localComputers.find((item) => item.cloudId === snapshot.id || item.id === snapshot.id)
     if (local && local.syncStatus && local.syncStatus !== 'synced' && local.ownerId === remote.ownerId) continue
