@@ -1,5 +1,8 @@
 import { collection, deleteDoc, doc, getCountFromServer, getDoc, getDocs, limit, orderBy, query, setDoc, startAfter, where, type QueryConstraint, type QueryDocumentSnapshot } from 'firebase/firestore'
 import {
+  completeComputerSync,
+  completeDeleteSync,
+  completeSessionSync,
   deleteComputer,
   deleteLocalSession,
   getComputer,
@@ -7,7 +10,7 @@ import {
   getPendingSyncQueue,
   listComputers,
   listSessions,
-  removeSyncQueueItem,
+  markSyncQueueFailure,
   saveComputer,
   saveSession,
   updateComputerPhotoState,
@@ -25,6 +28,9 @@ export interface SyncSummary {
   synced: number
   errors: number
   photosLocalOnly: number
+  pending: number
+  retryAfterMs?: number
+  lastError?: string
 }
 
 export interface CreatorIdentity {
@@ -91,19 +97,21 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
 
   if (item.operation === 'upsert-session') {
     const session = (await listSessions()).find((entry) => entry.id === item.entityId)
-    if (!session || session.ownerId !== ownerId) return false
+    if (!session) return completeDeleteSync(item)
+    if (session.ownerId !== ownerId) throw new Error('La sesión pendiente pertenece a otra cuenta')
     await updateSessionSyncState(session.id, 'syncing')
     const cloudId = session.cloudId || session.id
     const reference = doc(firestore, SHARED_SESSIONS, cloudId)
     await setDoc(reference, sessionPayload(session, ownerId, cloudId))
     const verified = await getDoc(reference)
     if (!verified.exists() || verified.data().ownerId !== ownerId) throw new Error('Firebase no confirmó la sesión')
-    await updateSessionSyncState(session.id, 'synced', undefined, cloudId, true)
+    return completeSessionSync(item, cloudId)
   }
 
   if (item.operation === 'upsert-computer') {
     const computer = await getComputer(item.entityId)
-    if (!computer || computer.ownerId !== ownerId) return false
+    if (!computer) return completeDeleteSync(item)
+    if (computer.ownerId !== ownerId) throw new Error('El equipo pendiente pertenece a otra cuenta')
     await updateComputerSyncState(computer.id, 'syncing')
     const duplicateId = await findRemoteDuplicate(computer)
     const knownId = computer.cloudId || computer.id
@@ -121,7 +129,7 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
         await setDoc(reference, computerPayload(syncedComputer, ownerId, cloudId))
         await updateComputerPhotoState(computer.id, { photoRemote, photoNeedsUpload: false, photoUploadStatus: 'uploaded', photoUploadError: undefined })
         if (previous && previous.fileId !== photoRemote.fileId) {
-          await cleanupReplacedImageKitPhoto(cloudId, previous.fileId).catch(() => undefined)
+          await cleanupReplacedImageKitPhoto(cloudId, previous.fileId).catch((error) => console.warn('No se pudo limpiar la fotografía reemplazada', error))
         }
       } else {
         syncedComputer = { ...computer, photoNeedsUpload: true, photoUploadStatus: 'pending' }
@@ -130,7 +138,14 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
     }
     const verified = await getDoc(reference)
     if (!verified.exists() || verified.data().ownerId !== ownerId) throw new Error('Firebase no confirmó el equipo')
-    await updateComputerSyncState(computer.id, 'synced', undefined, cloudId, syncedComputer.photoPath, true)
+    return completeComputerSync(item, cloudId, {
+      photoRemote: syncedComputer.photoRemote,
+      photoNeedsUpload: syncedComputer.photoNeedsUpload,
+      photoUploadStatus: syncedComputer.photoUploadStatus,
+      photoUploadError: syncedComputer.photoUploadError,
+      photoStoredLocally: syncedComputer.photoStoredLocally,
+      photoPath: syncedComputer.photoPath
+    })
   }
 
   if (item.operation === 'delete-session') {
@@ -141,6 +156,7 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
       if (existing.data().ownerId !== ownerId) throw new Error('Solo el creador puede eliminar la sesión')
       await deleteDoc(reference)
     }
+    return completeDeleteSync(item)
   }
 
   if (item.operation === 'delete-computer') {
@@ -152,53 +168,99 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
       await deleteDoc(reference)
       // Solo se borra en ImageKit la foto de un equipo propio.
       if (item.photoFileId && imageKitConfigured) {
-        await deleteCurrentImageKitPhoto(remoteId, item.photoFileId).catch(() => undefined)
+        await deleteCurrentImageKitPhoto(remoteId, item.photoFileId).catch((error) => console.warn('El equipo se eliminó, pero no se pudo limpiar su fotografía', error))
       }
     }
+    return completeDeleteSync(item)
   }
-  await removeSyncQueueItem(item.id)
-  return true
+  return false
 }
 
-export async function synchronize(ownerId: string, report: SyncReporter = () => undefined): Promise<SyncSummary> {
+const syncInFlight = new Map<string, Promise<SyncSummary>>()
+const RETRY_BASE_MS = 1_000
+const RETRY_MAX_MS = 60_000
+
+const operationPriority = (item: SyncQueueItem) => {
+  if (item.operation === 'upsert-session') return 0
+  if (item.operation === 'upsert-computer') return 1
+  if (item.operation === 'delete-computer') return 2
+  return 3
+}
+
+const isTransientSyncError = (error: unknown) => {
+  if (!navigator.onLine) return true
+  const code = typeof error === 'object' && error && 'code' in error ? String(error.code).replace(/^firestore\//, '') : ''
+  return ['aborted', 'deadline-exceeded', 'internal', 'network-request-failed', 'resource-exhausted', 'unavailable', 'unknown'].includes(code)
+}
+
+export function synchronize(ownerId: string, report: SyncReporter = () => undefined, options: { force?: boolean } = {}): Promise<SyncSummary> {
+  const running = syncInFlight.get(ownerId)
+  if (running) return running
+  const promise = runSynchronize(ownerId, report, options).finally(() => syncInFlight.delete(ownerId))
+  syncInFlight.set(ownerId, promise)
+  return promise
+}
+
+async function runSynchronize(ownerId: string, report: SyncReporter, options: { force?: boolean }): Promise<SyncSummary> {
   if (!firestore) throw new Error('Firebase no está configurado')
   if (!navigator.onLine) {
     report('local', 'Guardado local')
-    return { synced: 0, errors: 0, photosLocalOnly: 0 }
+    return { synced: 0, errors: 0, photosLocalOnly: 0, pending: await pendingCount(ownerId) }
   }
-  const queue = (await getPendingSyncQueue())
-    .filter((item) => item.ownerId === ownerId)
-    .sort((left, right) => {
-      const priority = (item: SyncQueueItem) => item.operation === 'delete-computer' ? 0 : item.operation === 'delete-session' ? 1 : 2
-      return priority(left) - priority(right) || left.createdAt.localeCompare(right.createdAt)
-    })
-  if (!queue.length) {
-    report('synced', 'Sincronizado')
-    return { synced: 0, errors: 0, photosLocalOnly: 0 }
+  const initialQueue = (await getPendingSyncQueue()).filter((item) => item.ownerId === ownerId)
+  if (!initialQueue.length) {
+    const photosLocalOnly = (await listComputers()).filter((computer) => computer.ownerId === ownerId && computer.photo && !computer.photoRemote).length
+    report('synced', photosLocalOnly ? `Sincronizado · ${photosLocalOnly} foto${photosLocalOnly === 1 ? '' : 's'} pendiente${photosLocalOnly === 1 ? '' : 's'}` : 'Sincronizado')
+    return { synced: 0, errors: 0, photosLocalOnly, pending: 0 }
   }
   report('syncing', 'Sincronizando')
   let synced = 0
   let errors = 0
-  let photosLocalOnly = 0
-  for (const item of queue) {
-    try {
-      const didSync = await syncItem(ownerId, item)
-      if (didSync) synced += 1
-      const computer = item.operation === 'upsert-computer' ? await getComputer(item.entityId) : undefined
-      if (computer?.photo && !computer.photoRemote) photosLocalOnly += 1
-    } catch (error) {
-      errors += 1
-      const message = error instanceof Error ? error.message : 'Error desconocido'
-      if (item.operation.includes('computer')) {
-        await updateComputerSyncState(item.entityId, 'error', message)
-        if (item.operation === 'upsert-computer') await updateComputerPhotoState(item.entityId, { photoUploadStatus: 'error', photoUploadError: message })
+  let lastError = ''
+  let stoppedByTransientError = false
+  const processed = new Set<string>()
+  for (let pass = 0; pass < 20; pass += 1) {
+    const now = Date.now()
+    const queue = (await getPendingSyncQueue())
+      .filter((item) => item.ownerId === ownerId && !processed.has(`${item.id}:${item.revision || item.createdAt}`) && (options.force || !item.nextAttemptAt || Date.parse(item.nextAttemptAt) <= now))
+      .sort((left, right) => operationPriority(left) - operationPriority(right) || left.createdAt.localeCompare(right.createdAt))
+    if (!queue.length) break
+    for (const item of queue) {
+      processed.add(`${item.id}:${item.revision || item.createdAt}`)
+      try {
+        const didSync = await syncItem(ownerId, item)
+        if (didSync) synced += 1
+      } catch (error) {
+        errors += 1
+        const message = error instanceof Error ? error.message : 'Error desconocido'
+        lastError = message
+        const delay = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * (2 ** Math.min(item.attempts || 0, 6)))
+        const transient = isTransientSyncError(error)
+        await markSyncQueueFailure(item, message, new Date(Date.now() + delay).toISOString(), transient)
+        if (item.operation.includes('computer')) {
+          await updateComputerSyncState(item.entityId, 'error', message)
+          if (item.operation === 'upsert-computer') await updateComputerPhotoState(item.entityId, { photoUploadStatus: 'error', photoUploadError: message })
+        }
+        if (item.operation.includes('session')) await updateSessionSyncState(item.entityId, 'error', message)
+        if (transient) {
+          stoppedByTransientError = true
+          break
+        }
       }
-      if (item.operation.includes('session')) await updateSessionSyncState(item.entityId, 'error', message)
     }
+    if (stoppedByTransientError) break
   }
-  if (errors) report('error', 'Error al sincronizar')
-  else report('synced', 'Sincronizado')
-  return { synced, errors, photosLocalOnly }
+  const [remaining, localComputers] = await Promise.all([
+    getPendingSyncQueue().then((items) => items.filter((item) => item.ownerId === ownerId)),
+    listComputers()
+  ])
+  const photosLocalOnly = localComputers.filter((computer) => computer.ownerId === ownerId && computer.photo && !computer.photoRemote).length
+  const retryAt = remaining.filter((item) => item.retryable !== false).map((item) => item.nextAttemptAt).filter(Boolean).sort()[0]
+  const retryAfterMs = retryAt ? Math.max(0, Date.parse(retryAt) - Date.now()) : undefined
+  const photoMessage = photosLocalOnly ? ` · ${photosLocalOnly} foto${photosLocalOnly === 1 ? '' : 's'} pendiente${photosLocalOnly === 1 ? '' : 's'}` : ''
+  if (remaining.length) report(errors ? 'error' : 'local', `${remaining.length} pendiente${remaining.length === 1 ? '' : 's'}${lastError ? ` · ${lastError}` : ''}${photoMessage}`)
+  else report('synced', `Sincronizado · ${synced} operación${synced === 1 ? '' : 'es'}${photoMessage}`)
+  return { synced, errors, photosLocalOnly, pending: remaining.length, retryAfterMs, lastError: lastError || undefined }
 }
 
 export async function migrateLegacyCloudData(identity: CreatorIdentity) {

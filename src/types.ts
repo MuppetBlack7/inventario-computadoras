@@ -92,6 +92,11 @@ export interface SyncQueueItem {
   ownerId?: string
   photoFileId?: string
   createdAt: string
+  revision?: string
+  attempts?: number
+  nextAttemptAt?: string
+  lastError?: string
+  retryable?: boolean
 }
 
 export interface ParsedCodeData {

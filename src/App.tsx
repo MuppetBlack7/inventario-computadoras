@@ -46,6 +46,7 @@ export default function App() {
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('local')
   const [syncMessage, setSyncMessage] = useState('Guardado local')
   const [pending, setPending] = useState(0)
+  const [nextRetryAt, setNextRetryAt] = useState<number | null>(null)
   const [importPreview, setImportPreview] = useState<{ sessions: number; computers: number; photos: number } | null>(null)
   const [importBusy, setImportBusy] = useState(false)
 
@@ -66,22 +67,29 @@ export default function App() {
     setSyncMessage(message)
   }, [])
 
-  const runSync = useCallback(async (activeUser: User | null = user) => {
+  const applySyncResult = useCallback((result: SyncSummary) => {
+    setNextRetryAt(result.pending > 0 && result.retryAfterMs !== undefined ? Date.now() + Math.max(500, result.retryAfterMs) : null)
+    if (result.errors && result.lastError) setToast(`Sincronización pendiente: ${result.lastError}`)
+  }, [])
+
+  const runSync = useCallback(async (activeUser: User | null = user, force = false) => {
     if (!activeUser) {
       reportSync('local', 'Guardado local')
       return undefined
     }
     try {
-      const result = await synchronize(activeUser.uid, reportSync)
+      const result = await synchronize(activeUser.uid, reportSync, { force })
+      applySyncResult(result)
       await pullCloudData(activeUser.uid)
       await refresh(activeUser.uid)
       return result
     } catch (error) {
       reportSync('error', 'Error al sincronizar')
       setToast(error instanceof Error ? error.message : 'No fue posible sincronizar')
-      return { synced: 0, errors: 1, photosLocalOnly: 0 }
+      const pendingNow = await pendingCount(activeUser.uid)
+      return { synced: 0, errors: 1, photosLocalOnly: 0, pending: pendingNow, lastError: error instanceof Error ? error.message : 'No fue posible sincronizar' }
     }
-  }, [refresh, reportSync, user])
+  }, [applySyncResult, refresh, reportSync, user])
 
   const afterLocalChange = useCallback(async () => {
     reportSync('local', 'Guardado local')
@@ -117,11 +125,14 @@ export default function App() {
             const preview = await getLocalImportPreview()
             if (preview.sessions || preview.computers) setImportPreview(preview)
             else {
-              await synchronize(nextUser.uid, reportSync)
+              const result = await synchronize(nextUser.uid, reportSync)
+              applySyncResult(result)
               await pullCloudData(nextUser.uid)
             }
-          } catch {
+          } catch (error) {
+            console.error('No fue posible recuperar o sincronizar el inventario al iniciar', error)
             reportSync('error', 'Error al sincronizar')
+            setToast(error instanceof Error ? error.message : 'No fue posible sincronizar')
           }
           await refresh(nextUser.uid)
         } else {
@@ -167,18 +178,32 @@ export default function App() {
       active = false
       unsubscribe()
     }
-  }, [refresh, reportSync])
+  }, [applySyncResult, refresh, reportSync])
 
   useEffect(() => {
     const handleOnline = () => { if (user) void runSync(user) }
     const handleOffline = () => reportSync('local', 'Guardado local')
+    const handleResume = () => { if (user && navigator.onLine) void runSync(user) }
+    const handleVisibility = () => { if (document.visibilityState === 'visible') handleResume() }
     window.addEventListener('online', handleOnline)
     window.addEventListener('offline', handleOffline)
+    window.addEventListener('focus', handleResume)
+    window.addEventListener('pageshow', handleResume)
+    document.addEventListener('visibilitychange', handleVisibility)
     return () => {
       window.removeEventListener('online', handleOnline)
       window.removeEventListener('offline', handleOffline)
+      window.removeEventListener('focus', handleResume)
+      window.removeEventListener('pageshow', handleResume)
+      document.removeEventListener('visibilitychange', handleVisibility)
     }
   }, [reportSync, runSync, user])
+
+  useEffect(() => {
+    if (!user || nextRetryAt === null || !navigator.onLine) return
+    const timer = window.setTimeout(() => void runSync(user), Math.max(0, nextRetryAt - Date.now()))
+    return () => window.clearTimeout(timer)
+  }, [nextRetryAt, runSync, user])
 
   useEffect(() => {
     if (!toast) return
@@ -217,7 +242,7 @@ export default function App() {
           pending={pending}
           onLogin={() => void startGoogleLogin(setAuthError, setToast)}
           onLogout={() => { if (firebaseAuth) void signOut(firebaseAuth) }}
-          onSync={() => void runSync()}
+          onSync={() => void runSync(user, true)}
         />}
       </header>
 
@@ -302,7 +327,8 @@ export default function App() {
               setImportBusy(true)
               reportSync('syncing', 'Sincronizando')
               await claimLocalData(user.uid, user.displayName || '', user.email || '')
-              const result = await synchronize(user.uid, reportSync)
+              const result = await synchronize(user.uid, reportSync, { force: true })
+              applySyncResult(result)
               const verified = result.errors === 0 && await verifyCloudOwnership(user.uid)
               await pullCloudData(user.uid)
               await refresh(user.uid)

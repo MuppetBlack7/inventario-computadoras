@@ -44,15 +44,26 @@ export const getDatabase = () =>
     }
   })
 
-const queueItem = (operation: SyncQueueItem['operation'], entityId: string, ownerId?: string, remoteId?: string, photoFileId?: string): SyncQueueItem => ({
-  id: `${operation.includes('session') ? 'session' : 'computer'}:${entityId}`,
+const queueKey = (operation: SyncQueueItem['operation'], entityId: string) =>
+  `${operation.includes('session') ? 'session' : 'computer'}:${entityId}`
+
+const queueItem = (operation: SyncQueueItem['operation'], entityId: string, ownerId?: string, remoteId?: string, photoFileId?: string, previous?: SyncQueueItem): SyncQueueItem => ({
+  id: queueKey(operation, entityId),
   operation,
   entityId,
   remoteId,
   ownerId,
   photoFileId,
-  createdAt: new Date().toISOString()
+  createdAt: previous?.createdAt || new Date().toISOString(),
+  revision: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+  attempts: 0,
+  nextAttemptAt: undefined,
+  lastError: undefined,
+  retryable: undefined
 })
+
+const sameQueueRevision = (current: SyncQueueItem | undefined, expected: SyncQueueItem) =>
+  Boolean(current) && (expected.revision ? current?.revision === expected.revision : current?.createdAt === expected.createdAt && current?.operation === expected.operation)
 
 export async function listSessions() {
   const database = await getDatabase()
@@ -68,7 +79,11 @@ export async function saveSession(session: InventorySession, enqueue = true) {
   const prepared = enqueue ? { ...session, syncStatus: 'local' as const, syncError: undefined, updatedAt: new Date().toISOString() } : session
   const transaction = database.transaction(['sessions', 'syncQueue'], 'readwrite')
   await transaction.objectStore('sessions').put(prepared)
-  if (enqueue) await transaction.objectStore('syncQueue').put(queueItem('upsert-session', prepared.id, prepared.ownerId))
+  if (enqueue) {
+    const queue = transaction.objectStore('syncQueue')
+    const previous = await queue.get(queueKey('upsert-session', prepared.id))
+    await queue.put(queueItem('upsert-session', prepared.id, prepared.ownerId, prepared.cloudId, undefined, previous))
+  }
   await transaction.done
   return prepared
 }
@@ -82,9 +97,16 @@ export async function deleteSessionAndComputers(sessionId: string, ownerId?: str
   const computerKeys = await transaction.objectStore('computers').index('by-session').getAllKeys(sessionId)
   await Promise.all(computerKeys.map((key) => transaction.objectStore('computers').delete(key)))
   if (enqueue) {
-    for (const computer of existingComputers) await transaction.objectStore('syncQueue').put(queueItem('delete-computer', computer.id, ownerId, computer.cloudId, computer.photoRemote?.fileId))
+    const queue = transaction.objectStore('syncQueue')
+    for (const computer of existingComputers) {
+      const key = queueKey('delete-computer', computer.id)
+      const previous = await queue.get(key)
+      await queue.put(queueItem('delete-computer', computer.id, ownerId, computer.cloudId, computer.photoRemote?.fileId, previous))
+    }
     // Los equipos se eliminan antes que la sesión remota para no dejar registros huérfanos si se interrumpe la sincronización.
-    await transaction.objectStore('syncQueue').put(queueItem('delete-session', sessionId, ownerId, existingSession?.cloudId))
+    const sessionKey = queueKey('delete-session', sessionId)
+    const previous = await queue.get(sessionKey)
+    await queue.put(queueItem('delete-session', sessionId, ownerId, existingSession?.cloudId, undefined, previous))
   }
   await transaction.done
 }
@@ -118,7 +140,11 @@ export async function saveComputer(computer: ComputerRecord, enqueue = true) {
   const database = await getDatabase()
   const transaction = database.transaction(['computers', 'syncQueue'], 'readwrite')
   await transaction.objectStore('computers').put(prepared)
-  if (enqueue) await transaction.objectStore('syncQueue').put(queueItem('upsert-computer', prepared.id, prepared.ownerId))
+  if (enqueue) {
+    const queue = transaction.objectStore('syncQueue')
+    const previous = await queue.get(queueKey('upsert-computer', prepared.id))
+    await queue.put(queueItem('upsert-computer', prepared.id, prepared.ownerId, prepared.cloudId, prepared.photoRemote?.fileId, previous))
+  }
   await transaction.done
   return prepared
 }
@@ -128,7 +154,12 @@ export async function deleteComputer(id: string, ownerId?: string, enqueue = tru
   const existing = await database.get('computers', id)
   const transaction = database.transaction(['computers', 'syncQueue'], 'readwrite')
   await transaction.objectStore('computers').delete(id)
-  if (enqueue) await transaction.objectStore('syncQueue').put(queueItem('delete-computer', id, ownerId, existing?.cloudId, existing?.photoRemote?.fileId))
+  if (enqueue) {
+    const queue = transaction.objectStore('syncQueue')
+    const key = queueKey('delete-computer', id)
+    const previous = await queue.get(key)
+    await queue.put(queueItem('delete-computer', id, ownerId, existing?.cloudId, existing?.photoRemote?.fileId, previous))
+  }
   await transaction.done
 }
 
@@ -183,6 +214,66 @@ export async function getPendingSyncQueue() {
 export async function removeSyncQueueItem(id: string) {
   const database = await getDatabase()
   await database.delete('syncQueue', id)
+}
+
+export async function completeSessionSync(item: SyncQueueItem, cloudId: string) {
+  const database = await getDatabase()
+  const transaction = database.transaction(['sessions', 'syncQueue'], 'readwrite')
+  const queue = transaction.objectStore('syncQueue')
+  const current = await queue.get(item.id)
+  if (!sameQueueRevision(current, item)) {
+    await transaction.done
+    return false
+  }
+  const session = await transaction.objectStore('sessions').get(item.entityId)
+  if (session) await transaction.objectStore('sessions').put({ ...session, syncStatus: 'synced', syncError: undefined, cloudId, sharedCloud: true })
+  await queue.delete(item.id)
+  await transaction.done
+  return true
+}
+
+export async function completeComputerSync(item: SyncQueueItem, cloudId: string, changes: Partial<ComputerRecord> = {}) {
+  const database = await getDatabase()
+  const transaction = database.transaction(['computers', 'syncQueue'], 'readwrite')
+  const queue = transaction.objectStore('syncQueue')
+  const current = await queue.get(item.id)
+  if (!sameQueueRevision(current, item)) {
+    await transaction.done
+    return false
+  }
+  const computer = await transaction.objectStore('computers').get(item.entityId)
+  if (computer) await transaction.objectStore('computers').put({ ...computer, ...changes, syncStatus: 'synced', syncError: undefined, cloudId, sharedCloud: true })
+  await queue.delete(item.id)
+  await transaction.done
+  return true
+}
+
+export async function completeDeleteSync(item: SyncQueueItem) {
+  const database = await getDatabase()
+  const transaction = database.transaction('syncQueue', 'readwrite')
+  const queue = transaction.objectStore('syncQueue')
+  const current = await queue.get(item.id)
+  if (!sameQueueRevision(current, item)) {
+    await transaction.done
+    return false
+  }
+  await queue.delete(item.id)
+  await transaction.done
+  return true
+}
+
+export async function markSyncQueueFailure(item: SyncQueueItem, message: string, nextAttemptAt: string, retryable: boolean) {
+  const database = await getDatabase()
+  const transaction = database.transaction('syncQueue', 'readwrite')
+  const queue = transaction.objectStore('syncQueue')
+  const current = await queue.get(item.id)
+  if (!sameQueueRevision(current, item)) {
+    await transaction.done
+    return false
+  }
+  await queue.put({ ...current!, attempts: (current?.attempts || 0) + 1, nextAttemptAt, lastError: message, retryable })
+  await transaction.done
+  return true
 }
 
 export async function updateSessionSyncState(id: string, status: SyncStatus, error?: string, cloudId?: string, sharedCloud?: boolean) {
