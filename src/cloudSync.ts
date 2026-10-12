@@ -8,9 +8,12 @@ import {
   getComputer,
   getDatabase,
   getPendingSyncQueue,
+  isSyncQueueItemCurrent,
   listComputers,
   listSessions,
   markSyncQueueFailure,
+  queuePhotoCleanup,
+  savePhotoCandidate,
   saveComputer,
   saveSession,
   updateComputerPhotoState,
@@ -18,7 +21,7 @@ import {
   updateSessionSyncState
 } from './db'
 import { firestore } from './firebaseClient'
-import { cleanupReplacedImageKitPhoto, deleteCurrentImageKitPhoto, imageKitConfigured, uploadPhotoToImageKit } from './imageKitClient'
+import { cleanupImageKitPhoto, imageKitConfigured, uploadPhotoToImageKit } from './imageKitClient'
 import type { ComputerRecord, InventorySession, SyncQueueItem, SyncStatus } from './types'
 
 const SHARED_SESSIONS = 'inventorySessions'
@@ -94,6 +97,8 @@ async function findRemoteDuplicate(computer: ComputerRecord) {
 async function syncItem(ownerId: string, item: SyncQueueItem) {
   if (!firestore) throw new Error('Firestore no está configurado')
   if (item.ownerId !== ownerId) return false
+  // Una operación terminada tarde nunca puede ejecutar efectos sobre una revisión más nueva.
+  if (!await isSyncQueueItemCurrent(item)) return false
 
   if (item.operation === 'upsert-session') {
     const session = (await listSessions()).find((entry) => entry.id === item.entityId)
@@ -118,26 +123,43 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
     if (duplicateId && duplicateId !== knownId) throw new Error('Ya existe un equipo con el mismo número de serie o inventario')
     const cloudId = duplicateId || knownId
     const reference = doc(firestore, SHARED_COMPUTERS, cloudId)
+    if (!await isSyncQueueItemCurrent(item)) return false
+    // Crea o actualiza primero el documento conservando la fotografía anterior.
+    // El Worker exige que el equipo exista y pertenezca al usuario antes de aceptar una carga.
     await setDoc(reference, computerPayload(computer, ownerId, cloudId))
     let syncedComputer = computer
+    let uploadedCandidate = item.photoCandidate && item.photoSourceRevision === computer.photoLocalRevision
+      ? item.photoCandidate
+      : undefined
     if (computer.photo && (computer.photoNeedsUpload || !computer.photoRemote)) {
       if (imageKitConfigured) {
         await updateComputerPhotoState(computer.id, { photoUploadStatus: 'uploading', photoUploadError: undefined })
-        const previous = computer.photoRemote
-        const photoRemote = await uploadPhotoToImageKit(cloudId, computer.photo, computer.photoName)
-        syncedComputer = { ...computer, photoRemote, photoNeedsUpload: false, photoUploadStatus: 'uploaded', photoUploadError: undefined, photoStoredLocally: false }
-        await setDoc(reference, computerPayload(syncedComputer, ownerId, cloudId))
-        await updateComputerPhotoState(computer.id, { photoRemote, photoNeedsUpload: false, photoUploadStatus: 'uploaded', photoUploadError: undefined })
-        if (previous && previous.fileId !== photoRemote.fileId) {
-          await cleanupReplacedImageKitPhoto(cloudId, previous.fileId).catch((error) => console.warn('No se pudo limpiar la fotografía reemplazada', error))
+        if (!uploadedCandidate) {
+          uploadedCandidate = await uploadPhotoToImageKit(cloudId, computer.photo, computer.photoName)
+          if (!await savePhotoCandidate(item, uploadedCandidate, computer.photoLocalRevision)) return false
         }
+        syncedComputer = { ...computer, photoRemote: uploadedCandidate, photoNeedsUpload: false, photoUploadStatus: 'uploaded', photoUploadError: undefined, photoStoredLocally: false }
       } else {
         syncedComputer = { ...computer, photoNeedsUpload: true, photoUploadStatus: 'pending' }
         await updateComputerPhotoState(computer.id, { photoNeedsUpload: true, photoUploadStatus: 'pending', photoUploadError: 'Backend de ImageKit pendiente de configurar' })
       }
     }
+    if (!await isSyncQueueItemCurrent(item)) {
+      if (uploadedCandidate) await queuePhotoCleanup({ entityId: computer.id, remoteId: cloudId, sessionId: computer.sessionId, ownerId, fileId: uploadedCandidate.fileId, reason: 'orphan-upload', blockedByQueueItemId: item.id })
+      return false
+    }
+    if (uploadedCandidate) await setDoc(reference, computerPayload(syncedComputer, ownerId, cloudId))
     const verified = await getDoc(reference)
-    if (!verified.exists() || verified.data().ownerId !== ownerId) throw new Error('Firebase no confirmó el equipo')
+    if (!verified.exists() || verified.data().ownerId !== ownerId || (uploadedCandidate && verified.data().photoRemote?.fileId !== uploadedCandidate.fileId)) {
+      throw new Error('Firebase no confirmó el equipo y su fotografía')
+    }
+    if (!await isSyncQueueItemCurrent(item)) {
+      if (uploadedCandidate) await queuePhotoCleanup({ entityId: computer.id, remoteId: cloudId, sessionId: computer.sessionId, ownerId, fileId: uploadedCandidate.fileId, reason: 'orphan-upload', blockedByQueueItemId: item.id })
+      return false
+    }
+    const cleanupFileIds = computer.photoRemote && uploadedCandidate && computer.photoRemote.fileId !== uploadedCandidate.fileId
+      ? [computer.photoRemote.fileId]
+      : []
     return completeComputerSync(item, cloudId, {
       photoRemote: syncedComputer.photoRemote,
       photoNeedsUpload: syncedComputer.photoNeedsUpload,
@@ -145,10 +167,12 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
       photoUploadError: syncedComputer.photoUploadError,
       photoStoredLocally: syncedComputer.photoStoredLocally,
       photoPath: syncedComputer.photoPath
-    })
+    }, cleanupFileIds)
   }
 
   if (item.operation === 'delete-session') {
+    const computerDeletes = (await getPendingSyncQueue()).filter((queued) => queued.operation === 'delete-computer' && queued.sessionId === item.entityId)
+    if (computerDeletes.length) return false
     const reference = doc(firestore, SHARED_SESSIONS, item.remoteId || item.entityId)
     // Si nunca llegó a Firestore no hay nada que borrar (las reglas rechazan borrar documentos inexistentes).
     const existing = await getDoc(reference)
@@ -165,12 +189,27 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
     const existing = await getDoc(reference)
     if (existing.exists()) {
       if (existing.data().ownerId !== ownerId) throw new Error('Solo el creador puede eliminar el equipo')
-      await deleteDoc(reference)
-      // Solo se borra en ImageKit la foto de un equipo propio.
-      if (item.photoFileId && imageKitConfigured) {
-        await deleteCurrentImageKitPhoto(remoteId, item.photoFileId).catch((error) => console.warn('El equipo se eliminó, pero no se pudo limpiar su fotografía', error))
+      const currentFileId = existing.data().photoRemote?.fileId as string | undefined
+      if (currentFileId) {
+        await queuePhotoCleanup({
+          entityId: item.entityId,
+          remoteId,
+          sessionId: item.sessionId,
+          ownerId,
+          fileId: currentFileId,
+          reason: 'deleted-computer',
+          blockedByQueueItemId: item.id
+        })
       }
+      await deleteDoc(reference)
     }
+    return completeDeleteSync(item)
+  }
+  if (item.operation === 'cleanup-photo') {
+    if (!item.photoFileId) return completeDeleteSync(item)
+    if (item.blockedByQueueItemId && (await getPendingSyncQueue()).some((queued) => queued.id === item.blockedByQueueItemId)) return false
+    if (!imageKitConfigured) throw new Error('ImageKit está pendiente de configurar')
+    await cleanupImageKitPhoto(item.remoteId || item.entityId, item.photoFileId)
     return completeDeleteSync(item)
   }
   return false
@@ -184,7 +223,8 @@ const operationPriority = (item: SyncQueueItem) => {
   if (item.operation === 'upsert-session') return 0
   if (item.operation === 'upsert-computer') return 1
   if (item.operation === 'delete-computer') return 2
-  return 3
+  if (item.operation === 'cleanup-photo') return 3
+  return 4
 }
 
 const isTransientSyncError = (error: unknown) => {
@@ -242,7 +282,7 @@ async function runSynchronize(ownerId: string, report: SyncReporter, options: { 
           if (item.operation === 'upsert-computer') await updateComputerPhotoState(item.entityId, { photoUploadStatus: 'error', photoUploadError: message })
         }
         if (item.operation.includes('session')) await updateSessionSyncState(item.entityId, 'error', message)
-        if (transient) {
+        if (transient && item.operation !== 'cleanup-photo') {
           stoppedByTransientError = true
           break
         }
@@ -255,10 +295,12 @@ async function runSynchronize(ownerId: string, report: SyncReporter, options: { 
     listComputers()
   ])
   const photosLocalOnly = localComputers.filter((computer) => computer.ownerId === ownerId && computer.photo && !computer.photoRemote).length
+  const cleanupPending = remaining.filter((item) => item.operation === 'cleanup-photo').length
   const retryAt = remaining.filter((item) => item.retryable !== false).map((item) => item.nextAttemptAt).filter(Boolean).sort()[0]
   const retryAfterMs = retryAt ? Math.max(0, Date.parse(retryAt) - Date.now()) : undefined
   const photoMessage = photosLocalOnly ? ` · ${photosLocalOnly} foto${photosLocalOnly === 1 ? '' : 's'} pendiente${photosLocalOnly === 1 ? '' : 's'}` : ''
-  if (remaining.length) report(errors ? 'error' : 'local', `${remaining.length} pendiente${remaining.length === 1 ? '' : 's'}${lastError ? ` · ${lastError}` : ''}${photoMessage}`)
+  const cleanupMessage = cleanupPending ? ` · ${cleanupPending} limpieza${cleanupPending === 1 ? '' : 's'} pendiente${cleanupPending === 1 ? '' : 's'}` : ''
+  if (remaining.length) report(errors ? 'error' : 'local', `${remaining.length} pendiente${remaining.length === 1 ? '' : 's'}${lastError ? ` · ${lastError}` : ''}${photoMessage}${cleanupMessage}`)
   else report('synced', `Sincronizado · ${synced} operación${synced === 1 ? '' : 'es'}${photoMessage}`)
   return { synced, errors, photosLocalOnly, pending: remaining.length, retryAfterMs, lastError: lastError || undefined }
 }

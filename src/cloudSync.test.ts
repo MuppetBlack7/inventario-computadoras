@@ -6,7 +6,13 @@ const store = vi.hoisted(() => ({
   data: new Map<string, Map<string, Row>>(), reads: 0, setCalls: 0, activeSets: 0, maxActiveSets: 0,
   failSetAt: 0, setDelayMs: 0, deleteLog: [] as string[], setHook: undefined as undefined | ((ref: { name: string; id: string }, row: Row) => Promise<void>)
 }))
-const photoStore = vi.hoisted(() => ({ failUpload: false, uploads: 0 }))
+const photoStore = vi.hoisted(() => ({
+  failUpload: false,
+  uploads: 0,
+  failDeletes: 0,
+  deletes: [] as string[],
+  uploadHook: undefined as undefined | (() => Promise<void>)
+}))
 
 vi.mock('./firebaseClient', () => ({ firestore: {} }))
 vi.mock('firebase/firestore', () => {
@@ -59,15 +65,26 @@ vi.mock('firebase/firestore', () => {
 vi.mock('./imageKitClient', () => ({
   imageKitConfigured: true,
   uploadPhotoToImageKit: vi.fn(async (_computerId: string, photo: Blob) => {
-    photoStore.uploads += 1
     if (photoStore.failUpload) throw Object.assign(new Error('ImageKit no disponible'), { code: 'unavailable' })
-    return { fileId: 'photo-1', url: 'https://example.com/photo.jpg', filePath: '/photo.jpg', name: 'photo.jpg', size: photo.size, width: null, height: null, mimeType: photo.type, uploadedAt: minute(0) }
+    photoStore.uploads += 1
+    if (photoStore.uploadHook) await photoStore.uploadHook()
+    const fileId = `photo-${photoStore.uploads}`
+    return { fileId, url: `https://example.com/${fileId}.jpg`, filePath: `/inventario/alice/${fileId}.jpg`, name: `${fileId}.jpg`, size: photo.size, width: null, height: null, mimeType: photo.type, uploadedAt: minute(0) }
   }),
-  cleanupReplacedImageKitPhoto: vi.fn(),
-  deleteCurrentImageKitPhoto: vi.fn()
+  cleanupImageKitPhoto: vi.fn(async (_computerId: string, fileId: string) => {
+    if (photoStore.failDeletes > 0) {
+      photoStore.failDeletes -= 1
+      throw Object.assign(new Error('ImageKit no disponible'), { code: 'unavailable' })
+    }
+    if (![...store.data.get('inventoryComputers')!.values()].some((row) => row.photoRemote?.fileId === fileId)) {
+      if (!photoStore.deletes.includes(fileId)) photoStore.deletes.push(fileId)
+    }
+    else throw Object.assign(new Error('La fotografía todavía está referenciada'), { code: 'aborted' })
+    return { deleted: true }
+  })
 }))
 
-import { clearAllData, deleteComputer, deleteSessionAndComputers, getPendingSyncQueue, listComputers, listSessions, listVisibleComputers, saveComputer, saveSession } from './db'
+import { clearAllData, deleteComputer, deleteSessionAndComputers, getPendingSyncQueue, listComputers, listSessions, listVisibleComputers, queuePhotoCleanup, saveComputer, saveSession } from './db'
 import { pullCloudData, synchronize } from './cloudSync'
 import { normalizeKey } from './utils'
 import type { ComputerRecord, InventorySession } from './types'
@@ -97,6 +114,9 @@ const seed = () => {
   store.setHook = undefined
   photoStore.failUpload = false
   photoStore.uploads = 0
+  photoStore.failDeletes = 0
+  photoStore.deletes = []
+  photoStore.uploadHook = undefined
 }
 
 const localSession = (owner = 'alice'): InventorySession => ({
@@ -280,5 +300,119 @@ describe('descarga incremental de Firestore', () => {
     await synchronize('alice')
     await pullCloudData('alice', { force: true })
     expect((await listComputers()).filter((item) => item.id === 'local-7')).toHaveLength(1)
+  })
+
+  it('reemplaza una foto y limpia la anterior solo después de confirmar la nueva', async () => {
+    const previous = { fileId: 'old-photo', url: 'https://example.com/old.jpg', filePath: '/inventario/alice/old.jpg', name: 'old.jpg', size: 3, width: null, height: null, mimeType: 'image/jpeg', uploadedAt: minute(0) }
+    const record = { ...localComputer(8), cloudId: 'local-8', sharedCloud: true, photoRemote: previous, photo: new Blob(['new'], { type: 'image/jpeg' }), photoNeedsUpload: true, photoLocalRevision: 'photo-rev-1' }
+    store.data.get('inventoryComputers')!.set('local-8', { ...remoteComputer(8, 'alice', 'local-session'), photoRemote: previous })
+    await saveComputer(record)
+    const result = await synchronize('alice')
+    expect(result.pending).toBe(0)
+    expect(store.data.get('inventoryComputers')!.get('local-8')!.photoRemote.fileId).toBe('photo-1')
+    expect(photoStore.deletes).toEqual(['old-photo'])
+  })
+
+  it('si falla la subida nueva conserva la fotografía anterior activa', async () => {
+    const previous = { fileId: 'old-upload', url: 'https://example.com/old.jpg', filePath: '/inventario/alice/old.jpg', name: 'old.jpg', size: 3, width: null, height: null, mimeType: 'image/jpeg', uploadedAt: minute(0) }
+    store.data.get('inventoryComputers')!.set('local-15', { ...remoteComputer(15, 'alice', 'local-session'), id: 'local-15', cloudId: 'local-15', photoRemote: previous })
+    await saveComputer({ ...localComputer(15), cloudId: 'local-15', photoRemote: previous, photo: new Blob(['new'], { type: 'image/jpeg' }), photoNeedsUpload: true, photoLocalRevision: 'failed-upload' })
+    photoStore.failUpload = true
+    const result = await synchronize('alice')
+    expect(result.pending).toBe(1)
+    expect(store.data.get('inventoryComputers')!.get('local-15')!.photoRemote.fileId).toBe('old-upload')
+    expect(photoStore.deletes).toEqual([])
+    expect((await listComputers()).find((item) => item.id === 'local-15')!.photoRemote?.fileId).toBe('old-upload')
+  })
+
+  it('si falla Firestore después de subir, reutiliza la candidata y conserva ambas fotos válidas', async () => {
+    const previous = { fileId: 'old-photo', url: 'https://example.com/old.jpg', filePath: '/inventario/alice/old.jpg', name: 'old.jpg', size: 3, width: null, height: null, mimeType: 'image/jpeg', uploadedAt: minute(0) }
+    store.data.get('inventoryComputers')!.set('local-9', { ...remoteComputer(9, 'alice', 'local-session'), id: 'local-9', cloudId: 'local-9', photoRemote: previous })
+    await saveComputer({ ...localComputer(9), cloudId: 'local-9', photoRemote: previous, photo: new Blob(['new'], { type: 'image/jpeg' }), photoNeedsUpload: true, photoLocalRevision: 'photo-rev-2' })
+    store.failSetAt = 2
+    const failed = await synchronize('alice')
+    expect(failed.pending).toBe(1)
+    expect(photoStore.uploads).toBe(1)
+    expect(photoStore.deletes).toEqual([])
+    expect(store.data.get('inventoryComputers')!.get('local-9')!.photoRemote.fileId).toBe('old-photo')
+    store.failSetAt = 0
+    const recovered = await synchronize('alice', undefined, { force: true })
+    expect(recovered.pending).toBe(0)
+    expect(photoStore.uploads).toBe(1)
+    expect(photoStore.deletes).toEqual(['old-photo'])
+  })
+
+  it('conserva una limpieza fallida y la completa en el siguiente reintento', async () => {
+    const photoRemote = { fileId: 'delete-photo', url: 'https://example.com/delete.jpg', filePath: '/inventario/alice/delete.jpg', name: 'delete.jpg', size: 3, width: null, height: null, mimeType: 'image/jpeg', uploadedAt: minute(0) }
+    const record = { ...localComputer(10), cloudId: 'local-10', sharedCloud: true, syncStatus: 'synced' as const, photoRemote }
+    store.data.get('inventoryComputers')!.set('local-10', { ...remoteComputer(10, 'alice', 'local-session'), id: 'local-10', cloudId: 'local-10', photoRemote })
+    await saveComputer(record, false)
+    await deleteComputer(record.id, 'alice')
+    photoStore.failDeletes = 1
+    const failed = await synchronize('alice')
+    expect(failed.pending).toBe(1)
+    expect((await getPendingSyncQueue())[0]).toMatchObject({ operation: 'cleanup-photo', photoFileId: 'delete-photo', attempts: 1 })
+    await synchronize('alice', undefined, { force: true })
+    expect(await getPendingSyncQueue()).toHaveLength(0)
+    expect(photoStore.deletes).toEqual(['delete-photo'])
+  })
+
+  it('no limpia una foto que todavía referencia otro equipo', async () => {
+    const sharedPhoto = { fileId: 'shared-photo', url: 'https://example.com/shared.jpg', filePath: '/inventario/alice/shared.jpg', name: 'shared.jpg', size: 3, width: null, height: null, mimeType: 'image/jpeg', uploadedAt: minute(0) }
+    for (const id of ['shared-a', 'shared-b']) {
+      store.data.get('inventoryComputers')!.set(id, { ...remoteComputer(11, 'alice', 'local-session'), id, cloudId: id, photoRemote: sharedPhoto })
+      await saveComputer({ ...localComputer(11), id, cloudId: id, sharedCloud: true, syncStatus: 'synced', photoRemote: sharedPhoto }, false)
+    }
+    await deleteComputer('shared-a', 'alice')
+    const result = await synchronize('alice')
+    expect(result.pending).toBe(1)
+    expect(photoStore.deletes).toEqual([])
+    expect((await getPendingSyncQueue())[0].operation).toBe('cleanup-photo')
+  })
+
+  it('hace idempotente una limpieza repetida', async () => {
+    await queuePhotoCleanup({ entityId: 'gone', remoteId: 'gone', ownerId: 'alice', fileId: 'same-photo', reason: 'orphan-upload' })
+    await synchronize('alice')
+    await queuePhotoCleanup({ entityId: 'gone', remoteId: 'gone', ownerId: 'alice', fileId: 'same-photo', reason: 'orphan-upload' })
+    await synchronize('alice')
+    expect(photoStore.deletes).toEqual(['same-photo'])
+    expect(await getPendingSyncQueue()).toHaveLength(0)
+  })
+
+  it('una nueva foto durante otra sincronización gana sin borrar la activa', async () => {
+    const previous = { fileId: 'old-concurrent', url: 'https://example.com/old.jpg', filePath: '/inventario/alice/old.jpg', name: 'old.jpg', size: 3, width: null, height: null, mimeType: 'image/jpeg', uploadedAt: minute(0) }
+    store.data.get('inventoryComputers')!.set('local-12', { ...remoteComputer(12, 'alice', 'local-session'), id: 'local-12', cloudId: 'local-12', photoRemote: previous })
+    await saveComputer({ ...localComputer(12), cloudId: 'local-12', photoRemote: previous, photo: new Blob(['first'], { type: 'image/jpeg' }), photoNeedsUpload: true, photoLocalRevision: 'first' })
+    let changed = false
+    photoStore.uploadHook = async () => {
+      if (changed) return
+      changed = true
+      const latest = (await listComputers()).find((item) => item.id === 'local-12')!
+      await saveComputer({ ...latest, photo: new Blob(['second'], { type: 'image/jpeg' }), photoNeedsUpload: true, photoLocalRevision: 'second' })
+    }
+    const result = await synchronize('alice')
+    expect(result.pending).toBe(0)
+    expect(photoStore.uploads).toBe(2)
+    expect(store.data.get('inventoryComputers')!.get('local-12')!.photoRemote.fileId).toBe('photo-2')
+    expect(photoStore.deletes.sort()).toEqual(['old-concurrent', 'photo-1'].sort())
+  })
+
+  it('eliminar una sesión sustituye operaciones pendientes y no permite que reaparezcan', async () => {
+    await saveSession(localSession())
+    await saveComputer({ ...localComputer(13), photo: new Blob(['local'], { type: 'image/jpeg' }), photoNeedsUpload: true })
+    await deleteSessionAndComputers('local-session', 'alice')
+    expect((await getPendingSyncQueue()).some((item) => item.operation.startsWith('upsert-'))).toBe(false)
+    await synchronize('alice')
+    expect([...store.data.get('inventoryComputers')!.keys()].some((id) => id === 'local-13')).toBe(false)
+  })
+
+  it('una limpieza fallida no bloquea las demás operaciones', async () => {
+    await queuePhotoCleanup({ entityId: 'gone', remoteId: 'gone', ownerId: 'alice', fileId: 'retry-photo', reason: 'orphan-upload' })
+    await saveComputer(localComputer(14))
+    photoStore.failDeletes = 1
+    const result = await synchronize('alice')
+    expect(store.data.get('inventoryComputers')!.has('local-14')).toBe(true)
+    expect(result.pending).toBe(1)
+    expect((await getPendingSyncQueue())[0].operation).toBe('cleanup-photo')
   })
 })

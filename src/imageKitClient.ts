@@ -15,8 +15,11 @@ async function authenticatedFetch(path: string, init: RequestInit = {}) {
     headers: { ...init.headers, Authorization: `Bearer ${token}` }
   })
   if (!response.ok) {
-    const body = await response.json().catch(() => ({})) as { error?: string }
-    throw new Error(body.error || `ImageKit respondió ${response.status}`)
+    const body = await response.json().catch(() => ({})) as { error?: string; code?: string }
+    const error = Object.assign(new Error(body.error || `ImageKit respondió ${response.status}`), {
+      code: body.code || (response.status >= 500 ? 'unavailable' : response.status === 409 ? 'aborted' : 'permission-denied')
+    })
+    throw error
   }
   return response
 }
@@ -55,20 +58,12 @@ export async function downloadRemotePhoto(computerId: string, reference: ImageKi
   return await response.blob()
 }
 
-export async function deleteCurrentImageKitPhoto(computerId: string, fileId: string) {
+export async function cleanupImageKitPhoto(computerId: string, fileId: string) {
   if (!imageKitConfigured) throw new Error('ImageKit está pendiente de configurar')
-  await authenticatedFetch('/delete-current', {
+  const response = await authenticatedFetch('/cleanup-photo', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ computerId, fileId })
   })
-}
-
-export async function cleanupReplacedImageKitPhoto(computerId: string, fileId: string) {
-  if (!imageKitConfigured) return
-  await authenticatedFetch('/cleanup-replaced', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ computerId, fileId })
-  })
+  return await response.json() as { deleted: boolean; alreadyDeleted?: boolean }
 }

@@ -44,7 +44,15 @@ export function ComputerForm({ initial, sessionName, onCancel, onSaved, onOpenEx
     setStatus('Procesando fotografía…')
     try {
       const photo = await compressPhoto(file)
-      setComputer((current) => ({ ...current, photo, photoName: file.name, photoNeedsUpload: true, photoUploadStatus: 'pending', photoUploadError: undefined }))
+      setComputer((current) => ({
+        ...current,
+        photo,
+        photoName: file.name,
+        photoNeedsUpload: true,
+        photoUploadStatus: 'pending',
+        photoUploadError: undefined,
+        photoLocalRevision: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`
+      }))
       setStatus('Fotografía lista · pendiente de subir')
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'No fue posible procesar la fotografía')

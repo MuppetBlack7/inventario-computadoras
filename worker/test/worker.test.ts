@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import worker, { buildSignedImageUrl, isAllowedOrigin } from '../src/index'
+import worker, { buildSignedImageUrl, canCleanupImageKitFile, isAllowedOrigin, ownsImageKitFile } from '../src/index'
 
 describe('ImageKit Worker', () => {
   it('solo admite los orígenes de la aplicación y desarrollo local', () => {
@@ -31,5 +31,14 @@ describe('ImageKit Worker', () => {
 
     expect(response.status).toBe(401)
     await expect(response.json()).resolves.toEqual({ error: 'missing-token' })
+  })
+
+  it('solo autoriza limpiar archivos etiquetados para el usuario y equipo correctos', () => {
+    const file = { fileId: 'photo-1', filePath: '/inventario/alice/photo-1.jpg', tags: ['inventario-computadoras', 'owner-alice', 'computer-equipo-1'] }
+    expect(ownsImageKitFile(file, 'alice', 'equipo-1')).toBe(true)
+    expect(canCleanupImageKitFile(file, 'alice', 'equipo-1', false)).toBe(true)
+    expect(canCleanupImageKitFile(file, 'bob', 'equipo-1', false)).toBe(false)
+    expect(canCleanupImageKitFile(file, 'alice', 'equipo-2', false)).toBe(false)
+    expect(canCleanupImageKitFile(file, 'alice', 'equipo-1', true)).toBe(false)
   })
 })

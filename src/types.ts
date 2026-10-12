@@ -76,21 +76,30 @@ export interface ComputerRecord {
   photoNeedsUpload?: boolean
   photoUploadStatus?: PhotoUploadStatus
   photoUploadError?: string
+  /** Cambia cada vez que el usuario selecciona una fotografía local distinta. */
+  photoLocalRevision?: string
   syncStatus?: SyncStatus
   syncError?: string
   createdAt: string
   updatedAt: string
 }
 
-export type SyncOperation = 'upsert-session' | 'delete-session' | 'upsert-computer' | 'delete-computer'
+export type SyncOperation = 'upsert-session' | 'delete-session' | 'upsert-computer' | 'delete-computer' | 'cleanup-photo'
+export type PhotoCleanupReason = 'replaced-photo' | 'deleted-computer' | 'orphan-upload'
 
 export interface SyncQueueItem {
   id: string
   operation: SyncOperation
   entityId: string
   remoteId?: string
+  sessionId?: string
   ownerId?: string
   photoFileId?: string
+  photoCandidate?: ImageKitPhotoReference
+  photoSourceRevision?: string
+  cleanupFileIds?: string[]
+  cleanupReason?: PhotoCleanupReason
+  blockedByQueueItemId?: string
   createdAt: string
   revision?: string
   attempts?: number

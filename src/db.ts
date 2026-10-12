@@ -1,5 +1,5 @@
 import { openDB, type DBSchema } from 'idb'
-import type { ComputerRecord, InventorySession, SyncQueueItem, SyncStatus } from './types'
+import type { ComputerRecord, ImageKitPhotoReference, InventorySession, PhotoCleanupReason, SyncQueueItem, SyncStatus } from './types'
 import { normalizeKey } from './utils'
 
 interface InventoryDB extends DBSchema {
@@ -44,11 +44,13 @@ export const getDatabase = () =>
     }
   })
 
-const queueKey = (operation: SyncQueueItem['operation'], entityId: string) =>
-  `${operation.includes('session') ? 'session' : 'computer'}:${entityId}`
+const queueKey = (operation: SyncQueueItem['operation'], entityId: string, photoFileId?: string) =>
+  operation === 'cleanup-photo'
+    ? `photo:${photoFileId || entityId}`
+    : `${operation.includes('session') ? 'session' : 'computer'}:${entityId}`
 
-const queueItem = (operation: SyncQueueItem['operation'], entityId: string, ownerId?: string, remoteId?: string, photoFileId?: string, previous?: SyncQueueItem): SyncQueueItem => ({
-  id: queueKey(operation, entityId),
+const queueItem = (operation: SyncQueueItem['operation'], entityId: string, ownerId?: string, remoteId?: string, photoFileId?: string, previous?: SyncQueueItem, extras: Partial<SyncQueueItem> = {}): SyncQueueItem => ({
+  id: queueKey(operation, entityId, photoFileId),
   operation,
   entityId,
   remoteId,
@@ -59,7 +61,8 @@ const queueItem = (operation: SyncQueueItem['operation'], entityId: string, owne
   attempts: 0,
   nextAttemptAt: undefined,
   lastError: undefined,
-  retryable: undefined
+  retryable: undefined,
+  ...extras
 })
 
 const sameQueueRevision = (current: SyncQueueItem | undefined, expected: SyncQueueItem) =>
@@ -101,7 +104,16 @@ export async function deleteSessionAndComputers(sessionId: string, ownerId?: str
     for (const computer of existingComputers) {
       const key = queueKey('delete-computer', computer.id)
       const previous = await queue.get(key)
-      await queue.put(queueItem('delete-computer', computer.id, ownerId, computer.cloudId, computer.photoRemote?.fileId, previous))
+      await queue.put(queueItem('delete-computer', computer.id, ownerId, computer.cloudId, computer.photoRemote?.fileId, previous, { sessionId }))
+      if (computer.photoRemote?.fileId) {
+        const cleanupKey = queueKey('cleanup-photo', computer.id, computer.photoRemote.fileId)
+        const previousCleanup = await queue.get(cleanupKey)
+        await queue.put(queueItem('cleanup-photo', computer.id, ownerId, computer.cloudId, computer.photoRemote.fileId, previousCleanup, {
+          sessionId,
+          cleanupReason: 'deleted-computer',
+          blockedByQueueItemId: key
+        }))
+      }
     }
     // Los equipos se eliminan antes que la sesión remota para no dejar registros huérfanos si se interrumpe la sincronización.
     const sessionKey = queueKey('delete-session', sessionId)
@@ -129,13 +141,17 @@ export async function getComputer(id: string) {
 }
 
 export async function saveComputer(computer: ComputerRecord, enqueue = true) {
+  const localPhotoRevision = computer.photoNeedsUpload && computer.photo
+    ? computer.photoLocalRevision || crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`
+    : computer.photoLocalRevision
   const prepared: ComputerRecord = {
     ...computer,
     inventoryNormalized: normalizeKey(computer.inventoryId),
     serialNormalized: normalizeKey(computer.serialNumber),
     updatedAt: enqueue ? new Date().toISOString() : computer.updatedAt,
     syncStatus: enqueue ? 'local' : computer.syncStatus,
-    syncError: enqueue ? undefined : computer.syncError
+    syncError: enqueue ? undefined : computer.syncError,
+    photoLocalRevision: localPhotoRevision
   }
   const database = await getDatabase()
   const transaction = database.transaction(['computers', 'syncQueue'], 'readwrite')
@@ -143,7 +159,22 @@ export async function saveComputer(computer: ComputerRecord, enqueue = true) {
   if (enqueue) {
     const queue = transaction.objectStore('syncQueue')
     const previous = await queue.get(queueKey('upsert-computer', prepared.id))
-    await queue.put(queueItem('upsert-computer', prepared.id, prepared.ownerId, prepared.cloudId, prepared.photoRemote?.fileId, previous))
+    const samePhoto = previous?.photoCandidate && previous.photoSourceRevision === prepared.photoLocalRevision
+    const next = queueItem('upsert-computer', prepared.id, prepared.ownerId, prepared.cloudId, prepared.photoRemote?.fileId, previous, {
+      sessionId: prepared.sessionId,
+      photoCandidate: samePhoto ? previous.photoCandidate : undefined,
+      photoSourceRevision: samePhoto ? previous.photoSourceRevision : prepared.photoLocalRevision
+    })
+    await queue.put(next)
+    if (previous?.photoCandidate && !samePhoto) {
+      const cleanupKey = queueKey('cleanup-photo', prepared.id, previous.photoCandidate.fileId)
+      const previousCleanup = await queue.get(cleanupKey)
+      await queue.put(queueItem('cleanup-photo', prepared.id, prepared.ownerId, prepared.cloudId, previous.photoCandidate.fileId, previousCleanup, {
+        sessionId: prepared.sessionId,
+        cleanupReason: 'orphan-upload',
+        blockedByQueueItemId: next.id
+      }))
+    }
   }
   await transaction.done
   return prepared
@@ -158,7 +189,16 @@ export async function deleteComputer(id: string, ownerId?: string, enqueue = tru
     const queue = transaction.objectStore('syncQueue')
     const key = queueKey('delete-computer', id)
     const previous = await queue.get(key)
-    await queue.put(queueItem('delete-computer', id, ownerId, existing?.cloudId, existing?.photoRemote?.fileId, previous))
+    await queue.put(queueItem('delete-computer', id, ownerId, existing?.cloudId, existing?.photoRemote?.fileId, previous, { sessionId: existing?.sessionId }))
+    if (existing?.photoRemote?.fileId) {
+      const cleanupKey = queueKey('cleanup-photo', id, existing.photoRemote.fileId)
+      const previousCleanup = await queue.get(cleanupKey)
+      await queue.put(queueItem('cleanup-photo', id, ownerId, existing.cloudId, existing.photoRemote.fileId, previousCleanup, {
+        sessionId: existing.sessionId,
+        cleanupReason: 'deleted-computer',
+        blockedByQueueItemId: key
+      }))
+    }
   }
   await transaction.done
 }
@@ -232,7 +272,7 @@ export async function completeSessionSync(item: SyncQueueItem, cloudId: string) 
   return true
 }
 
-export async function completeComputerSync(item: SyncQueueItem, cloudId: string, changes: Partial<ComputerRecord> = {}) {
+export async function completeComputerSync(item: SyncQueueItem, cloudId: string, changes: Partial<ComputerRecord> = {}, cleanupFileIds: string[] = []) {
   const database = await getDatabase()
   const transaction = database.transaction(['computers', 'syncQueue'], 'readwrite')
   const queue = transaction.objectStore('syncQueue')
@@ -243,6 +283,15 @@ export async function completeComputerSync(item: SyncQueueItem, cloudId: string,
   }
   const computer = await transaction.objectStore('computers').get(item.entityId)
   if (computer) await transaction.objectStore('computers').put({ ...computer, ...changes, syncStatus: 'synced', syncError: undefined, cloudId, sharedCloud: true })
+  for (const fileId of new Set(cleanupFileIds.filter(Boolean))) {
+    if (changes.photoRemote?.fileId === fileId) continue
+    const cleanupKey = queueKey('cleanup-photo', item.entityId, fileId)
+    const previousCleanup = await queue.get(cleanupKey)
+    await queue.put(queueItem('cleanup-photo', item.entityId, item.ownerId, cloudId, fileId, previousCleanup, {
+      sessionId: computer?.sessionId || item.sessionId,
+      cleanupReason: 'replaced-photo'
+    }))
+  }
   await queue.delete(item.id)
   await transaction.done
   return true
@@ -258,6 +307,60 @@ export async function completeDeleteSync(item: SyncQueueItem) {
     return false
   }
   await queue.delete(item.id)
+  await transaction.done
+  return true
+}
+
+export async function isSyncQueueItemCurrent(item: SyncQueueItem) {
+  const database = await getDatabase()
+  return sameQueueRevision(await database.get('syncQueue', item.id), item)
+}
+
+export async function savePhotoCandidate(item: SyncQueueItem, photoCandidate: ImageKitPhotoReference, photoSourceRevision?: string) {
+  const database = await getDatabase()
+  const transaction = database.transaction('syncQueue', 'readwrite')
+  const queue = transaction.objectStore('syncQueue')
+  const current = await queue.get(item.id)
+  if (sameQueueRevision(current, item)) {
+    await queue.put({ ...current!, photoCandidate, photoSourceRevision })
+    await transaction.done
+    return true
+  }
+  const cleanupKey = queueKey('cleanup-photo', item.entityId, photoCandidate.fileId)
+  const previousCleanup = await queue.get(cleanupKey)
+  await queue.put(queueItem('cleanup-photo', item.entityId, item.ownerId, item.remoteId, photoCandidate.fileId, previousCleanup, {
+    sessionId: item.sessionId,
+    cleanupReason: 'orphan-upload',
+    blockedByQueueItemId: current?.operation === 'upsert-computer' ? current.id : undefined
+  }))
+  await transaction.done
+  return false
+}
+
+export async function queuePhotoCleanup(input: {
+  entityId: string
+  remoteId?: string
+  sessionId?: string
+  ownerId?: string
+  fileId: string
+  reason: PhotoCleanupReason
+  blockedByQueueItemId?: string
+}) {
+  const database = await getDatabase()
+  const transaction = database.transaction(['computers', 'syncQueue'], 'readwrite')
+  const activeReferences = (await transaction.objectStore('computers').getAll()).filter((computer) => computer.photoRemote?.fileId === input.fileId)
+  if (activeReferences.length && !input.blockedByQueueItemId) {
+    await transaction.done
+    return false
+  }
+  const queue = transaction.objectStore('syncQueue')
+  const key = queueKey('cleanup-photo', input.entityId, input.fileId)
+  const previous = await queue.get(key)
+  await queue.put(queueItem('cleanup-photo', input.entityId, input.ownerId, input.remoteId, input.fileId, previous, {
+    sessionId: input.sessionId,
+    cleanupReason: input.reason,
+    blockedByQueueItemId: input.blockedByQueueItemId
+  }))
   await transaction.done
   return true
 }

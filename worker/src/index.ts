@@ -74,6 +74,15 @@ async function loadComputer(computerId: string, token: string, env: Env) {
   return await response.json() as { fields?: FirestoreFields }
 }
 
+async function loadComputerOptional(computerId: string, token: string, env: Env) {
+  try {
+    return await loadComputer(computerId, token, env)
+  } catch (error) {
+    if (error instanceof Response && error.status === 404) return undefined
+    throw error
+  }
+}
+
 const stringField = (fields: FirestoreFields | undefined, name: string) => fields?.[name]?.stringValue || ''
 const remotePhotoFields = (fields: FirestoreFields | undefined) => fields?.photoRemote?.mapValue?.fields
 
@@ -87,14 +96,14 @@ async function imageKitUpload(request: Request, uid: string, computerId: string,
   const bytes = await request.arrayBuffer()
   if (!bytes.byteLength || bytes.byteLength > MAX_IMAGE_BYTES) throw new Response('invalid-image-size', { status: 413 })
   const extension = mimeType === 'image/png' ? 'png' : mimeType === 'image/webp' ? 'webp' : 'jpg'
-  const safeName = `${computerId}.${extension}`
+  const safeName = `${computerId}-${crypto.randomUUID()}.${extension}`
   const form = new FormData()
   form.set('file', new File([bytes], safeName, { type: mimeType }))
   form.set('fileName', safeName)
   form.set('folder', `/inventario/${uid}`)
   form.set('isPrivateFile', 'true')
-  form.set('useUniqueFileName', 'false')
-  form.set('overwriteFile', 'true')
+  form.set('useUniqueFileName', 'true')
+  form.set('overwriteFile', 'false')
   form.set('tags', `inventario-computadoras,owner-${uid},computer-${computerId}`)
   const response = await fetch('https://upload.imagekit.io/api/v1/files/upload', {
     method: 'POST',
@@ -138,6 +147,43 @@ async function deleteImageKitFile(fileId: string, env: Env) {
   if (!response.ok && response.status !== 404) throw new Response('imagekit-delete-failed', { status: 502 })
 }
 
+type ImageKitFile = { fileId?: string; filePath?: string; tags?: string[] }
+
+async function loadImageKitFile(fileId: string, env: Env): Promise<ImageKitFile | undefined> {
+  const response = await fetch(`https://api.imagekit.io/v1/files/${encodeURIComponent(fileId)}/details`, {
+    headers: { Authorization: imageKitAuthHeader(env.IMAGEKIT_PRIVATE_KEY) }
+  })
+  if (response.status === 404) return undefined
+  if (!response.ok) throw new Response('imagekit-file-check-failed', { status: 502 })
+  return await response.json() as ImageKitFile
+}
+
+async function photoIsReferenced(fileId: string, token: string, env: Env) {
+  const response = await fetch(`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(env.FIREBASE_PROJECT_ID)}/databases/(default)/documents:runQuery`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ structuredQuery: {
+      from: [{ collectionId: 'inventoryComputers' }],
+      where: { fieldFilter: { field: { fieldPath: 'photoRemote.fileId' }, op: 'EQUAL', value: { stringValue: fileId } } },
+      limit: 1
+    } })
+  })
+  if (!response.ok) throw new Response('firestore-reference-check-failed', { status: response.status === 401 || response.status === 403 ? 403 : 502 })
+  const rows = await response.json() as Array<{ document?: unknown }>
+  return rows.some((row) => Boolean(row.document))
+}
+
+export function ownsImageKitFile(file: ImageKitFile, uid: string, computerId: string) {
+  const tags = Array.isArray(file.tags) ? file.tags : []
+  return file.filePath?.startsWith(`/inventario/${uid}/`) === true
+    && tags.includes(`owner-${uid}`)
+    && tags.includes(`computer-${computerId}`)
+}
+
+export function canCleanupImageKitFile(file: ImageKitFile, uid: string, computerId: string, referenced: boolean) {
+  return !referenced && ownsImageKitFile(file, uid, computerId)
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const origin = request.headers.get('origin') || ''
@@ -156,30 +202,36 @@ export default {
         : {}
       const computerId = url.searchParams.get('computerId') || body.computerId || ''
       if (!computerId || computerId.includes('/')) return json(origin, { error: 'Identificador inválido' }, 400)
-      const computer = await loadComputer(computerId, token, env)
-      const fields = computer.fields
-      const ownerId = stringField(fields, 'ownerId')
-      const storedPhoto = remotePhotoFields(fields)
-      const storedFileId = stringField(storedPhoto, 'fileId')
-
       if (action === 'upload') {
+        const computer = await loadComputer(computerId, token, env)
+        const ownerId = stringField(computer.fields, 'ownerId')
         if (ownerId !== uid) return json(origin, { error: 'Solo el creador puede subir fotografías' }, 403)
         return json(origin, await imageKitUpload(request, uid, computerId, env))
       }
       if (action === 'sign') {
+        const computer = await loadComputer(computerId, token, env)
+        const storedPhoto = remotePhotoFields(computer.fields)
+        const storedFileId = stringField(storedPhoto, 'fileId')
         if (!storedFileId || storedFileId !== body.fileId) return json(origin, { error: 'Fotografía no asociada' }, 404)
         const filePath = stringField(storedPhoto, 'filePath')
         return json(origin, await buildSignedImageUrl(env.IMAGEKIT_URL_ENDPOINT, env.IMAGEKIT_PRIVATE_KEY, filePath, Boolean(body.thumbnail)))
       }
-      if (ownerId !== uid) return json(origin, { error: 'Solo el creador puede eliminar fotografías' }, 403)
-      if (!body.fileId) return json(origin, { error: 'Falta fileId' }, 400)
-      if (action === 'delete-current') {
-        if (storedFileId !== body.fileId) return json(origin, { error: 'La fotografía activa cambió' }, 409)
-        await deleteImageKitFile(body.fileId, env)
-        return json(origin, { deleted: true })
-      }
-      if (action === 'cleanup-replaced') {
-        if (storedFileId === body.fileId) return json(origin, { error: 'No se elimina la fotografía activa' }, 409)
+      if (action === 'cleanup-photo' || action === 'cleanup-replaced' || action === 'delete-current') {
+        if (!body.fileId) return json(origin, { error: 'Falta fileId', code: 'invalid-argument' }, 400)
+        const computer = await loadComputerOptional(computerId, token, env)
+        if (computer && stringField(computer.fields, 'ownerId') !== uid) {
+          return json(origin, { error: 'Solo el creador puede eliminar fotografías', code: 'permission-denied' }, 403)
+        }
+        const storedFileId = computer ? stringField(remotePhotoFields(computer.fields), 'fileId') : ''
+        const referenced = storedFileId === body.fileId || await photoIsReferenced(body.fileId, token, env)
+        if (referenced) {
+          return json(origin, { error: 'La fotografía todavía está referenciada', code: 'aborted' }, 409)
+        }
+        const file = await loadImageKitFile(body.fileId, env)
+        if (!file) return json(origin, { deleted: false, alreadyDeleted: true })
+        if (!canCleanupImageKitFile(file, uid, computerId, referenced)) {
+          return json(origin, { error: 'La fotografía no pertenece al equipo y usuario indicados', code: 'permission-denied' }, 403)
+        }
         await deleteImageKitFile(body.fileId, env)
         return json(origin, { deleted: true })
       }

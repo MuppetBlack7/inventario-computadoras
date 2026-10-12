@@ -8,6 +8,7 @@ import {
   claimLocalData,
   deleteSessionAndComputers,
   findDuplicates,
+  getDatabase,
   getPendingSyncQueue,
   listComputers,
   listSessions,
@@ -90,8 +91,49 @@ describe('inventario local', () => {
     expect(await listSessions()).toHaveLength(0)
     expect(await listComputers()).toHaveLength(0)
     const pending = await getPendingSyncQueue()
-    expect(pending.map((item) => item.operation).sort()).toEqual(['delete-computer', 'delete-session'])
+    expect(pending.map((item) => item.operation).sort()).toEqual(['cleanup-photo', 'delete-computer', 'delete-session'])
     expect(pending.find((item) => item.operation === 'delete-computer')).toMatchObject({ remoteId: 'remote-computer', photoFileId: 'file-1' })
+    expect(pending.find((item) => item.operation === 'cleanup-photo')).toMatchObject({
+      remoteId: 'remote-computer',
+      photoFileId: 'file-1',
+      ownerId: 'alice',
+      cleanupReason: 'deleted-computer',
+      blockedByQueueItemId: 'computer:computer-test'
+    })
+  })
+
+  it('elimina una sesión vacía dejando solo el borrado de la sesión', async () => {
+    await saveSession({ ...session, cloudId: 'remote-empty' })
+    await deleteSessionAndComputers(session.id, 'alice')
+    expect((await getPendingSyncQueue()).map((item) => item.operation)).toEqual(['delete-session'])
+  })
+
+  it('encola por separado las fotos de varios equipos y conserva la cola al reabrir IndexedDB', async () => {
+    await saveSession({ ...session, cloudId: 'remote-many' })
+    for (const number of [1, 2]) {
+      await saveComputer({
+        ...computer,
+        id: `computer-${number}`,
+        cloudId: `remote-${number}`,
+        photoRemote: { fileId: `file-${number}`, url: `https://example.com/${number}.jpg`, filePath: `/inventario/alice/${number}.jpg`, name: `${number}.jpg`, size: 4, width: null, height: null, mimeType: 'image/jpeg', uploadedAt: computer.updatedAt }
+      })
+    }
+    await deleteSessionAndComputers(session.id, 'alice')
+    let pending = await getPendingSyncQueue()
+    expect(pending.filter((item) => item.operation === 'delete-computer')).toHaveLength(2)
+    expect(pending.filter((item) => item.operation === 'cleanup-photo')).toHaveLength(2)
+    ;(await getDatabase()).close()
+    pending = await getPendingSyncQueue()
+    expect(pending.filter((item) => item.operation === 'cleanup-photo').map((item) => item.photoFileId).sort()).toEqual(['file-1', 'file-2'])
+  })
+
+  it('elimina de forma idempotente una sesión creada solo sin conexión', async () => {
+    await saveSession({ ...session, cloudId: undefined, sharedCloud: false })
+    await saveComputer({ ...computer, cloudId: undefined, sharedCloud: false, photoRemote: undefined })
+    await deleteSessionAndComputers(session.id, 'alice')
+    const pending = await getPendingSyncQueue()
+    expect(pending.map((item) => item.operation).sort()).toEqual(['delete-computer', 'delete-session'])
+    expect(pending.every((item) => !item.remoteId)).toBe(true)
   })
 
   it('muestra el inventario local compartido al iniciar sesión y aísla la cola offline por creador', async () => {

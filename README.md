@@ -48,6 +48,8 @@ Cloud Storage no se usa y `VITE_FIREBASE_STORAGE_ENABLED=false`. No se habilitó
 
 ### ImageKit protegido
 
+La PWA conserva reemplazos y borrados en una cola persistente de IndexedDB. Cada fotografía nueva recibe un `fileId` único; Firestore se confirma antes de programar la eliminación de la anterior. Las limpiezas fallidas conservan propietario, equipo, intentos, próxima ejecución y último error, y se reintentan al sincronizar, recuperar conexión o reabrir la aplicación. El Worker valida el token de Firebase, las referencias activas de Firestore y las etiquetas privadas de ImageKit antes de borrar.
+
 La integración usa `worker/src/index.ts` en Cloudflare Workers Free: valida el ID token de Firebase, comprueba autoría para subir/reemplazar/eliminar, limita imágenes a JPEG/PNG/WebP y 5 MB, sube archivos privados y entrega URL firmadas de cinco minutos a cualquier usuario autenticado. Firestore guarda solo `fileId`, URL, ruta y metadatos. El frontend nunca recibe la clave privada.
 
 Configuración segura:

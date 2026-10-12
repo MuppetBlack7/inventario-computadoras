@@ -5,8 +5,7 @@ vi.mock('./firebaseClient', () => ({ firestore: null }))
 vi.mock('./imageKitClient', () => ({
   imageKitConfigured: false,
   uploadPhotoToImageKit: vi.fn(),
-  cleanupReplacedImageKitPhoto: vi.fn(),
-  deleteCurrentImageKitPhoto: vi.fn()
+  cleanupImageKitPhoto: vi.fn()
 }))
 
 import { clearAllData, getPendingSyncQueue, saveComputer } from './db'
