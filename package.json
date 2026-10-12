@@ -22,14 +22,12 @@
     "exceljs": "^4.4.0",
     "firebase": "^13.0.0",
     "idb": "^8.0.3",
-    "qrcode": "^1.5.4",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
   "devDependencies": {
     "@firebase/rules-unit-testing": "^6.0.0",
     "@types/node": "^24.7.2",
-    "@types/qrcode": "^1.5.5",
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
     "@vitejs/plugin-react": "^5.0.4",

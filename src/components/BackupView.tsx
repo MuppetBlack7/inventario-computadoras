@@ -1,10 +1,7 @@
-import { useEffect, useState } from 'react'
-import QRCode from 'qrcode'
+import { useState } from 'react'
 import type { ComputerRecord, InventoryBackup, InventorySession } from '../types'
 import { downloadBackup, readBackupFile, restoreBackup } from '../backup'
 import { exportInventoryToExcel } from '../exportExcel'
-import { TEST_QR_DATA } from '../sampleData'
-import { downloadBlob } from '../utils'
 import { queueLocalPhotoMigrations } from '../db'
 import { imageKitConfigured } from '../imageKitClient'
 
@@ -21,11 +18,6 @@ export function BackupView({ sessions, computers, ownerId, onChanged }: Props) {
   const [backup, setBackup] = useState<InventoryBackup | null>(null)
   const [backupFileName, setBackupFileName] = useState('')
   const [replace, setReplace] = useState(false)
-  const [qrUrl, setQrUrl] = useState('')
-
-  useEffect(() => {
-    void QRCode.toDataURL(TEST_QR_DATA, { width: 360, margin: 2, errorCorrectionLevel: 'M', color: { dark: '#0c2e2a', light: '#ffffff' } }).then(setQrUrl)
-  }, [])
 
   const exportExcel = async () => {
     setStatus('Generando Excel con miniaturas…')
@@ -74,11 +66,6 @@ export function BackupView({ sessions, computers, ownerId, onChanged }: Props) {
     } catch (error) {
       setStatus(error instanceof Error ? `Error al restaurar: ${error.message}` : 'Error al restaurar')
     }
-  }
-
-  const downloadQr = async () => {
-    const svg = await QRCode.toString(TEST_QR_DATA, { type: 'svg', width: 640, margin: 3, color: { dark: '#0c2e2a', light: '#ffffff' } })
-    downloadBlob(new Blob([svg], { type: 'image/svg+xml' }), 'qr-prueba-inventario.svg')
   }
 
   const migratePhotos = async () => {
@@ -143,15 +130,6 @@ export function BackupView({ sessions, computers, ownerId, onChanged }: Props) {
           </div>}
         </section>
 
-        <section className="tool-card qr-card">
-          <div>
-            <p className="badge">PRUEBA</p>
-            <h2>QR estructurado de prueba</h2>
-            <p>Escanéalo desde otro dispositivo o descárgalo. Sus datos se identifican como demostración.</p>
-            <button className="ghost-button" onClick={() => void downloadQr()}>Descargar QR</button>
-          </div>
-          {qrUrl && <img src={qrUrl} alt="QR de prueba con datos estructurados" />}
-        </section>
       </div>
     </main>
   )

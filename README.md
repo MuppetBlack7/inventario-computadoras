@@ -103,7 +103,7 @@ Para permitir cuentas externas, el código no aplica dominios ni listas de corre
 - **Detalle/edición:** fotografía, especificaciones, varias unidades, ubicación, precisión y observaciones.
 - **Respaldo:** Excel con miniaturas y exactamente ocho columnas (`Tipo de equipo`, `Número de serie`, `Modelo`, `Número de inventario`, `Foto`, `RAM`, `Unidades`, `Sistema operativo`), además de respaldo JSON completo y restauración.
 
-El botón **Cargar datos de ejemplo** crea una sesión marcada como ejemplo. En **Respaldo** se incluye un QR estructurado descargable para probar el escáner.
+El botón **Cargar datos de ejemplo** crea una sesión marcada como ejemplo.
 
 ## Comprobación
 

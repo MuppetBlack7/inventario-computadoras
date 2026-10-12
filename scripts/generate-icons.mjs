@@ -2,7 +2,6 @@ import { deflateSync } from 'node:zlib'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import QRCode from 'qrcode'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 mkdirSync(resolve(root, 'public'), { recursive: true })
@@ -73,6 +72,4 @@ function makeIcon(size) {
 for (const [filename, size] of [['icon-192.png', 192], ['icon-512.png', 512], ['apple-touch-icon.png', 180]]) {
   writeFileSync(resolve(root, 'public', filename), makeIcon(size))
 }
-const testQr = JSON.stringify({ inventario: 'QR-DEMO-001', serie: 'SN-DEMO-2026-001', marca: 'Equipo de prueba', modelo: 'Modelo demostración', año: 'Desconocido', ubicacion: 'Laboratorio de prueba', observaciones: 'Registro generado con el QR de prueba; completar especificaciones manualmente.' })
-await QRCode.toFile(resolve(root, 'public', 'qr-prueba.png'), testQr, { width: 640, margin: 3, errorCorrectionLevel: 'M', color: { dark: '#0c2e2a', light: '#ffffff' } })
-console.log('Iconos PWA y QR de prueba generados.')
+console.log('Iconos PWA generados.')

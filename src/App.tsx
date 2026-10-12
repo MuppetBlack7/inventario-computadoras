@@ -3,6 +3,7 @@ import { onAuthStateChanged, signOut, type User } from 'firebase/auth'
 import { AuthSyncPanel } from './components/AuthSyncPanel'
 import { ComputerForm } from './components/ComputerForm'
 import { PhotoPreview } from './components/PhotoPreview'
+import { DatabaseBackupIcon, LayoutGridIcon, ScanLineIcon } from './components/NavIcons'
 import { createExampleData } from './sampleData'
 import {
   deleteComputer,
@@ -222,9 +223,9 @@ export default function App() {
   const openDetail = (id: string) => setView({ name: 'detail', computerId: id })
 
   const navItems = [
-    { key: 'sessions', label: 'Sesiones', icon: '▦', action: () => setView({ name: 'sessions' }) },
-    { key: 'scanner', label: 'Escanear', icon: '⌗', action: () => setView({ name: 'scanner', sessionId: currentSessionId }) },
-    { key: 'backup', label: 'Respaldo', icon: '↧', action: () => setView({ name: 'backup' }) }
+    { key: 'sessions', label: 'Sesiones', icon: <LayoutGridIcon />, action: () => setView({ name: 'sessions' }) },
+    { key: 'scanner', label: 'Escanear', icon: <ScanLineIcon />, action: () => setView({ name: 'scanner', sessionId: currentSessionId }) },
+    { key: 'backup', label: 'Respaldo', icon: <DatabaseBackupIcon />, action: () => setView({ name: 'backup' }) }
   ]
 
   return (
@@ -310,7 +311,7 @@ export default function App() {
       {user && <nav className="bottom-nav" aria-label="Navegación principal">
         {navItems.map((item) => {
           const active = item.key === view.name || (item.key === 'sessions' && ['inventory', 'form', 'detail'].includes(view.name))
-          return <button className={active ? 'active' : ''} key={item.key} onClick={item.action}><span>{item.icon}</span>{item.label}</button>
+          return <button className={active ? 'active' : ''} key={item.key} onClick={item.action}><span className="nav-icon">{item.icon}</span>{item.label}</button>
         })}
       </nav>}
       {toast && <div className="toast" role="status">✓ {toast}</div>}

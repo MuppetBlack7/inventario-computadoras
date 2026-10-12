@@ -2,16 +2,6 @@ import { saveComputer, saveSession } from './db'
 import type { ComputerRecord, InventorySession } from './types'
 import { normalizeKey, uid } from './utils'
 
-export const TEST_QR_DATA = JSON.stringify({
-  inventario: 'QR-DEMO-001',
-  serie: 'SN-DEMO-2026-001',
-  marca: 'Equipo de prueba',
-  modelo: 'Modelo demostración',
-  año: 'Desconocido',
-  ubicacion: 'Laboratorio de prueba',
-  observaciones: 'Registro generado con el QR de prueba; completar especificaciones manualmente.'
-})
-
 export async function createExampleData(ownerId?: string, ownerName = '', ownerEmail = '') {
   const stamp = new Date().toISOString()
   const session: InventorySession = {
@@ -42,7 +32,7 @@ export async function createExampleData(ownerId?: string, ownerName = '', ownerE
     operatingSystem: 'Sin confirmar',
     ramGB: 8,
     drives: [{ id: uid(), capacityGB: 256, type: 'SSD' }],
-    originalCode: TEST_QR_DATA,
+    originalCode: 'DATO-DE-EJEMPLO-SIN-ESCANEO',
     scannedAt: stamp,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Zona local desconocida',
     latitude: null,
