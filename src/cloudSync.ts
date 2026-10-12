@@ -1,4 +1,4 @@
-import { collection, deleteDoc, doc, getCountFromServer, getDoc, getDocs, limit, orderBy, query, setDoc, startAfter, where, type QueryConstraint, type QueryDocumentSnapshot } from 'firebase/firestore'
+import { collection, deleteDoc, doc, getCountFromServer, getDoc, getDocs, limit, onSnapshot, orderBy, query, setDoc, startAfter, where, type DocumentChange, type DocumentData, type QueryConstraint, type QueryDocumentSnapshot, type Unsubscribe } from 'firebase/firestore'
 import {
   completeComputerSync,
   completeDeleteSync,
@@ -36,6 +36,16 @@ export interface SyncSummary {
   lastError?: string
 }
 
+export interface FullSyncSummary extends SyncSummary {
+  pulled: PullStats
+}
+
+export interface RealtimeApplyStats {
+  sessions: number
+  computers: number
+  removed: number
+}
+
 export interface CreatorIdentity {
   uid: string
   displayName?: string | null
@@ -43,6 +53,18 @@ export interface CreatorIdentity {
 }
 
 export type SyncReporter = (status: SyncStatus, message: string) => void
+
+export function describeSyncError(error: unknown) {
+  const code = typeof error === 'object' && error && 'code' in error ? String(error.code).replace(/^firestore\//, '') : ''
+  const messages: Record<string, string> = {
+    'permission-denied': 'Firebase rechazó el acceso al inventario compartido.',
+    unauthenticated: 'La sesión de Google ya no es válida. Vuelve a iniciar sesión.',
+    unavailable: 'Firebase no está disponible temporalmente. Se reintentará al recuperar conexión.',
+    'network-request-failed': 'No fue posible comunicarse con Firebase.',
+    'failed-precondition': 'Firebase requiere una configuración adicional para esta consulta.'
+  }
+  return messages[code] || (error instanceof Error ? error.message : 'No fue posible actualizar el inventario')
+}
 
 const clean = <T extends object>(value: T): T =>
   JSON.parse(JSON.stringify(value, (_key, item) => item instanceof Blob || item === undefined ? undefined : item)) as T
@@ -301,7 +323,7 @@ async function runSynchronize(ownerId: string, report: SyncReporter, options: { 
   const photoMessage = photosLocalOnly ? ` · ${photosLocalOnly} foto${photosLocalOnly === 1 ? '' : 's'} pendiente${photosLocalOnly === 1 ? '' : 's'}` : ''
   const cleanupMessage = cleanupPending ? ` · ${cleanupPending} limpieza${cleanupPending === 1 ? '' : 's'} pendiente${cleanupPending === 1 ? '' : 's'}` : ''
   if (remaining.length) report(errors ? 'error' : 'local', `${remaining.length} pendiente${remaining.length === 1 ? '' : 's'}${lastError ? ` · ${lastError}` : ''}${photoMessage}${cleanupMessage}`)
-  else report('synced', `Sincronizado · ${synced} operación${synced === 1 ? '' : 'es'}${photoMessage}`)
+  else report('synced', `Sincronizado · ${synced} ${synced === 1 ? 'operación' : 'operaciones'}${photoMessage}`)
   return { synced, errors, photosLocalOnly, pending: remaining.length, retryAfterMs, lastError: lastError || undefined }
 }
 
@@ -413,7 +435,7 @@ async function loadRemote(name: string, localSharedCount: number, pendingDeleteC
   return { docs, full, reads }
 }
 
-let pullInFlight: Promise<PullStats> | undefined
+let pullInFlight: { force: boolean; promise: Promise<PullStats> } | undefined
 
 /**
  * Sincroniza hacia el dispositivo solo los documentos nuevos o modificados (paginado, orderBy + limit + startAfter).
@@ -421,8 +443,38 @@ let pullInFlight: Promise<PullStats> | undefined
  */
 export function pullCloudData(_ownerId: string, options: { force?: boolean } = {}): Promise<PullStats> {
   if (!firestore || !navigator.onLine) return Promise.resolve({ sessions: 0, computers: 0, reads: 0 })
-  if (!pullInFlight) pullInFlight = runPull(Boolean(options.force)).finally(() => { pullInFlight = undefined })
-  return pullInFlight
+  const force = Boolean(options.force)
+  if (pullInFlight) {
+    if (!force || pullInFlight.force) return pullInFlight.promise
+    return pullInFlight.promise.then(() => pullCloudData(_ownerId, { force: true }))
+  }
+  const promise = runPull(force).finally(() => {
+    if (pullInFlight?.promise === promise) pullInFlight = undefined
+  })
+  pullInFlight = { force, promise }
+  return promise
+}
+
+const fullSyncInFlight = new Map<string, { force: boolean; promise: Promise<FullSyncSummary> }>()
+
+/** Ejecuta escritura y descarga como una sola operación deduplicada. */
+export function synchronizeAndPull(ownerId: string, report: SyncReporter = () => undefined, options: { force?: boolean } = {}): Promise<FullSyncSummary> {
+  const running = fullSyncInFlight.get(ownerId)
+  const force = Boolean(options.force)
+  if (running) {
+    if (!force || running.force) return running.promise
+    return running.promise.then(() => synchronizeAndPull(ownerId, report, { force: true }))
+  }
+  const promise = (async () => {
+    report('syncing', 'Sincronizando…')
+    const written = await synchronize(ownerId, report, options)
+    const pulled = await pullCloudData(ownerId, { force })
+    return { ...written, pulled }
+  })().finally(() => {
+    if (fullSyncInFlight.get(ownerId)?.promise === promise) fullSyncInFlight.delete(ownerId)
+  })
+  fullSyncInFlight.set(ownerId, { force, promise })
+  return promise
 }
 
 async function runPull(force: boolean): Promise<PullStats> {
@@ -431,6 +483,10 @@ async function runPull(force: boolean): Promise<PullStats> {
   const pendingDeletes = queue.filter((item) => item.operation.startsWith('delete-'))
   const deletedSessions = new Set(pendingDeletes.filter((item) => item.operation === 'delete-session').flatMap((item) => [item.entityId, item.remoteId]))
   const deletedComputers = new Set(pendingDeletes.filter((item) => item.operation === 'delete-computer').flatMap((item) => [item.entityId, item.remoteId]))
+  const sessionPending = (localId: string | undefined, remoteId: string) => queue.some((item) =>
+    item.operation.includes('session') && (item.entityId === localId || item.entityId === remoteId || item.remoteId === remoteId))
+  const computerPending = (localId: string | undefined, remoteId: string) => queue.some((item) =>
+    item.operation.includes('computer') && (item.entityId === localId || item.entityId === remoteId || item.remoteId === remoteId))
   const sharedCount = <T extends { sharedCloud?: boolean; cloudId?: string; id: string }>(items: T[]) =>
     new Set(items.filter((item) => item.sharedCloud).map((item) => item.cloudId || item.id)).size
 
@@ -443,7 +499,7 @@ async function runPull(force: boolean): Promise<PullStats> {
     if (deletedSessions.has(snapshot.id)) continue
     const remote = snapshot.data() as InventorySession
     const local = localSessions.find((item) => item.cloudId === snapshot.id || item.id === snapshot.id)
-    if (local && local.syncStatus && local.syncStatus !== 'synced' && local.ownerId === remote.ownerId) continue
+    if (sessionPending(local?.id, snapshot.id)) continue
     await saveSession({ ...remote, id: local?.id || remote.id || snapshot.id, cloudId: snapshot.id, sharedCloud: true, syncStatus: 'synced', syncError: undefined }, false)
   }
 
@@ -451,17 +507,19 @@ async function runPull(force: boolean): Promise<PullStats> {
     if (deletedComputers.has(snapshot.id)) continue
     const remote = snapshot.data() as ComputerRecord
     const local = localComputers.find((item) => item.cloudId === snapshot.id || item.id === snapshot.id)
-    if (local && local.syncStatus && local.syncStatus !== 'synced' && local.ownerId === remote.ownerId) continue
+    if (computerPending(local?.id, snapshot.id)) continue
+    const keepLocalPhoto = Boolean(local?.photoNeedsUpload) || Boolean(local?.photoRemote?.fileId && local.photoRemote.fileId === remote.photoRemote?.fileId)
     await saveComputer({
       ...remote,
       equipmentType: remote.equipmentType || '',
       id: local?.id || remote.id || snapshot.id,
       cloudId: snapshot.id,
       sharedCloud: true,
-      photo: local?.photo,
-      photoNeedsUpload: local?.photoNeedsUpload,
+      photo: keepLocalPhoto ? local?.photo : undefined,
+      photoNeedsUpload: keepLocalPhoto ? local?.photoNeedsUpload : false,
       photoUploadStatus: remote.photoRemote ? 'uploaded' : local?.photoUploadStatus,
-      photoUploadError: local?.photoUploadError,
+      photoUploadError: keepLocalPhoto ? local?.photoUploadError : undefined,
+      photoLocalRevision: keepLocalPhoto ? local?.photoLocalRevision : undefined,
       syncStatus: 'synced',
       syncError: undefined
     }, false)
@@ -470,17 +528,113 @@ async function runPull(force: boolean): Promise<PullStats> {
   // Solo una descarga completa permite saber qué documentos desaparecieron de Firestore.
   if (computersResult.full) {
     const ids = new Set(computersResult.docs.map((entry) => entry.id))
-    for (const computer of localComputers.filter((item) => item.sharedCloud && item.syncStatus === 'synced' && !ids.has(item.cloudId || item.id))) {
+    for (const computer of localComputers.filter((item) => item.sharedCloud && !computerPending(item.id, item.cloudId || item.id) && !ids.has(item.cloudId || item.id))) {
       await deleteComputer(computer.id, computer.ownerId, false)
     }
   }
   if (sessionsResult.full) {
     const ids = new Set(sessionsResult.docs.map((entry) => entry.id))
-    for (const session of localSessions.filter((item) => item.sharedCloud && item.syncStatus === 'synced' && !ids.has(item.cloudId || item.id))) {
+    for (const session of localSessions.filter((item) => item.sharedCloud && !sessionPending(item.id, item.cloudId || item.id) && !ids.has(item.cloudId || item.id))) {
       await deleteLocalSession(session.id)
     }
   }
   return { sessions: sessionsResult.docs.length, computers: computersResult.docs.length, reads: sessionsResult.reads + computersResult.reads }
+}
+
+async function applySessionChanges(changes: Array<DocumentChange<DocumentData>>) {
+  let applied = 0
+  let removed = 0
+  for (const change of changes) {
+    const [sessions, queue] = await Promise.all([listSessions(), getPendingSyncQueue()])
+    const local = sessions.find((item) => item.cloudId === change.doc.id || item.id === change.doc.id)
+    const pending = queue.some((item) => item.operation.includes('session') && (item.entityId === local?.id || item.entityId === change.doc.id || item.remoteId === change.doc.id))
+    if (pending) continue
+    if (change.type === 'removed') {
+      if (local) {
+        await deleteLocalSession(local.id)
+        removed += 1
+      }
+      continue
+    }
+    const remote = change.doc.data() as InventorySession
+    await saveSession({ ...remote, id: local?.id || remote.id || change.doc.id, cloudId: change.doc.id, sharedCloud: true, syncStatus: 'synced', syncError: undefined }, false)
+    applied += 1
+  }
+  return { applied, removed }
+}
+
+async function applyComputerChanges(changes: Array<DocumentChange<DocumentData>>) {
+  let applied = 0
+  let removed = 0
+  for (const change of changes) {
+    const [computers, queue] = await Promise.all([listComputers(), getPendingSyncQueue()])
+    const local = computers.find((item) => item.cloudId === change.doc.id || item.id === change.doc.id)
+    const pending = queue.some((item) => item.operation.includes('computer') && (item.entityId === local?.id || item.entityId === change.doc.id || item.remoteId === change.doc.id))
+    if (pending) continue
+    if (change.type === 'removed') {
+      if (local) {
+        await deleteComputer(local.id, local.ownerId, false)
+        removed += 1
+      }
+      continue
+    }
+    const remote = change.doc.data() as ComputerRecord
+    const keepLocalPhoto = Boolean(local?.photoNeedsUpload) || Boolean(local?.photoRemote?.fileId && local.photoRemote.fileId === remote.photoRemote?.fileId)
+    await saveComputer({
+      ...remote,
+      equipmentType: remote.equipmentType || '',
+      id: local?.id || remote.id || change.doc.id,
+      cloudId: change.doc.id,
+      sharedCloud: true,
+      photo: keepLocalPhoto ? local?.photo : undefined,
+      photoNeedsUpload: keepLocalPhoto ? local?.photoNeedsUpload : false,
+      photoUploadStatus: remote.photoRemote ? 'uploaded' : keepLocalPhoto ? local?.photoUploadStatus : undefined,
+      photoUploadError: keepLocalPhoto ? local?.photoUploadError : undefined,
+      photoLocalRevision: keepLocalPhoto ? local?.photoLocalRevision : undefined,
+      syncStatus: 'synced',
+      syncError: undefined
+    }, false)
+    applied += 1
+  }
+  return { applied, removed }
+}
+
+/** Mantiene IndexedDB alineado con el inventario compartido sin reemplazar operaciones locales pendientes. */
+export function subscribeToSharedInventory(
+  _ownerId: string,
+  handlers: { onApplied: (stats: RealtimeApplyStats) => void | Promise<void>; onError: (error: Error) => void }
+): Unsubscribe {
+  if (!firestore) return () => undefined
+  let active = true
+  let chain = Promise.resolve()
+  const schedule = (task: () => Promise<RealtimeApplyStats>) => {
+    chain = chain.then(async () => {
+      if (!active) return
+      const stats = await task()
+      if (active && (stats.sessions || stats.computers || stats.removed)) await handlers.onApplied(stats)
+    }).catch((error) => {
+      if (active) handlers.onError(error instanceof Error ? error : new Error('No fue posible recibir cambios de Firestore'))
+    })
+  }
+  const sessionUnsubscribe = onSnapshot(collection(firestore, SHARED_SESSIONS), (snapshot) => {
+    const changes = snapshot.docChanges()
+    schedule(async () => {
+      const result = await applySessionChanges(changes)
+      return { sessions: result.applied, computers: 0, removed: result.removed }
+    })
+  }, (error) => { if (active) handlers.onError(error) })
+  const computerUnsubscribe = onSnapshot(collection(firestore, SHARED_COMPUTERS), (snapshot) => {
+    const changes = snapshot.docChanges()
+    schedule(async () => {
+      const result = await applyComputerChanges(changes)
+      return { sessions: 0, computers: result.applied, removed: result.removed }
+    })
+  }, (error) => { if (active) handlers.onError(error) })
+  return () => {
+    active = false
+    sessionUnsubscribe()
+    computerUnsubscribe()
+  }
 }
 
 export async function verifyCloudOwnership(ownerId: string) {

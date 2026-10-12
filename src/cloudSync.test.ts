@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 type Row = Record<string, any>
 const store = vi.hoisted(() => ({
   data: new Map<string, Map<string, Row>>(), reads: 0, setCalls: 0, activeSets: 0, maxActiveSets: 0,
-  failSetAt: 0, setDelayMs: 0, deleteLog: [] as string[], setHook: undefined as undefined | ((ref: { name: string; id: string }, row: Row) => Promise<void>)
+  failSetAt: 0, failReads: false, setDelayMs: 0, deleteLog: [] as string[],
+  listeners: new Map<string, Set<{ next: (snapshot: { docChanges: () => unknown[] }) => void; error: (error: Error) => void }>>(),
+  setHook: undefined as undefined | ((ref: { name: string; id: string }, row: Row) => Promise<void>)
 }))
 const photoStore = vi.hoisted(() => ({
   failUpload: false,
@@ -26,6 +28,7 @@ vi.mock('firebase/firestore', () => {
     limit: (n: number) => ({ kind: 'limit', n }),
     query: (base: { name: string }, ...constraints: Array<Record<string, unknown>>) => ({ name: base.name, constraints }),
     getDocs: async (q: { name: string; constraints: Array<Record<string, any>> }) => {
+      if (store.failReads) throw Object.assign(new Error('Permiso denegado'), { code: 'permission-denied' })
       let rows = [...(store.data.get(q.name) ?? new Map<string, Row>()).entries()]
       for (const c of q.constraints) if (c.kind === 'where') rows = rows.filter(([, row]) => c.op === '==' ? row[c.field] === c.value : String(row[c.field]) >= String(c.value))
       rows.sort((a, b) => String(a[1].updatedAt).localeCompare(String(b[1].updatedAt)))
@@ -37,10 +40,12 @@ vi.mock('firebase/firestore', () => {
       return { docs: rows.map(([id, row]) => snap(id, row)), size: rows.length }
     },
     getCountFromServer: async (base: { name: string }) => {
+      if (store.failReads) throw Object.assign(new Error('Permiso denegado'), { code: 'permission-denied' })
       store.reads += 1
       return { data: () => ({ count: (store.data.get(base.name) ?? new Map<string, Row>()).size }) }
     },
     getDoc: async (ref: { name: string; id: string }) => {
+      if (store.failReads) throw Object.assign(new Error('Permiso denegado'), { code: 'permission-denied' })
       const row = store.data.get(ref.name)?.get(ref.id)
       return row ? snap(ref.id, row) : { exists: () => false, data: () => undefined }
     },
@@ -58,7 +63,14 @@ vi.mock('firebase/firestore', () => {
       if (store.setHook) await store.setHook(ref, row)
       store.activeSets -= 1
     },
-    deleteDoc: async (ref: { name: string; id: string }) => { store.deleteLog.push(`${ref.name}/${ref.id}`); store.data.get(ref.name)?.delete(ref.id) }
+    deleteDoc: async (ref: { name: string; id: string }) => { store.deleteLog.push(`${ref.name}/${ref.id}`); store.data.get(ref.name)?.delete(ref.id) },
+    onSnapshot: (ref: { name: string }, next: (snapshot: { docChanges: () => unknown[] }) => void, error: (error: Error) => void) => {
+      const listeners = store.listeners.get(ref.name) ?? new Set()
+      const listener = { next, error }
+      listeners.add(listener)
+      store.listeners.set(ref.name, listeners)
+      return () => listeners.delete(listener)
+    }
   }
 })
 
@@ -85,7 +97,7 @@ vi.mock('./imageKitClient', () => ({
 }))
 
 import { clearAllData, deleteComputer, deleteSessionAndComputers, getPendingSyncQueue, listComputers, listSessions, listVisibleComputers, queuePhotoCleanup, saveComputer, saveSession } from './db'
-import { pullCloudData, synchronize } from './cloudSync'
+import { describeSyncError, pullCloudData, subscribeToSharedInventory, synchronize, synchronizeAndPull } from './cloudSync'
 import { normalizeKey } from './utils'
 import type { ComputerRecord, InventorySession } from './types'
 
@@ -109,14 +121,29 @@ const seed = () => {
   store.activeSets = 0
   store.maxActiveSets = 0
   store.failSetAt = 0
+  store.failReads = false
   store.setDelayMs = 0
   store.deleteLog = []
+  store.listeners = new Map()
   store.setHook = undefined
   photoStore.failUpload = false
   photoStore.uploads = 0
   photoStore.failDeletes = 0
   photoStore.deletes = []
   photoStore.uploadHook = undefined
+}
+
+const emitRemoteChanges = async (collectionName: string, changes: Array<{ type: 'added' | 'modified' | 'removed'; id: string; row?: Row }>) => {
+  const snapshot = {
+    docChanges: () => changes.map((change) => ({
+      type: change.type,
+      doc: { id: change.id, exists: () => change.type !== 'removed', data: () => change.row }
+    }))
+  }
+  for (const listener of store.listeners.get(collectionName) ?? []) listener.next(snapshot)
+  await vi.waitFor(async () => {
+    await Promise.resolve()
+  })
 }
 
 const localSession = (owner = 'alice'): InventorySession => ({
@@ -414,5 +441,114 @@ describe('descarga incremental de Firestore', () => {
     expect(store.data.get('inventoryComputers')!.has('local-14')).toBe(true)
     expect(result.pending).toBe(1)
     expect((await getPendingSyncQueue())[0].operation).toBe('cleanup-photo')
+  })
+})
+
+describe('sincronización manual y tiempo real compartido', () => {
+  it('descarga el inventario remoto aunque la cola local esté vacía', async () => {
+    expect(await getPendingSyncQueue()).toHaveLength(0)
+    const result = await synchronizeAndPull('bob', undefined, { force: true })
+    expect(result).toMatchObject({ synced: 0, errors: 0, pending: 0 })
+    expect(result.pulled.computers).toBe(250)
+    expect(await listComputers()).toHaveLength(250)
+  })
+
+  it('comparte una sola sincronización manual concurrente', async () => {
+    store.setDelayMs = 20
+    await saveComputer(localComputer(300))
+    const first = synchronizeAndPull('alice', undefined, { force: true })
+    const second = synchronizeAndPull('alice', undefined, { force: true })
+    expect(first).toBe(second)
+    await Promise.all([first, second])
+    expect(store.setCalls).toBe(1)
+  })
+
+  it('propaga un error real de lectura y lo describe para la interfaz', async () => {
+    store.failReads = true
+    const error = await synchronizeAndPull('alice', undefined, { force: true }).catch((caught) => caught)
+    expect(error).toMatchObject({ code: 'permission-denied' })
+    expect(describeSyncError(error)).toContain('rechazó el acceso')
+  })
+
+  it('recibe una alta creada por otra cuenta sin recargar', async () => {
+    let applied = 0
+    const unsubscribe = subscribeToSharedInventory('bob', { onApplied: (stats) => { applied += stats.computers }, onError: vi.fn() })
+    const row = { ...remoteComputer(900, 'alice', 's1'), id: 'realtime-new', cloudId: 'realtime-new' }
+    await emitRemoteChanges('inventoryComputers', [{ type: 'added', id: 'realtime-new', row }])
+    await vi.waitFor(async () => expect((await listComputers()).some((item) => item.cloudId === 'realtime-new')).toBe(true))
+    expect(applied).toBe(1)
+    unsubscribe()
+  })
+
+  it('aplica modificaciones remotas de sesión y equipo', async () => {
+    await pullCloudData('bob', { force: true })
+    const unsubscribe = subscribeToSharedInventory('bob', { onApplied: vi.fn(), onError: vi.fn() })
+    await emitRemoteChanges('inventorySessions', [{ type: 'modified', id: 's1', row: { ...store.data.get('inventorySessions')!.get('s1'), name: 'Sesión renovada' } }])
+    await emitRemoteChanges('inventoryComputers', [{ type: 'modified', id: 'c1', row: { ...store.data.get('inventoryComputers')!.get('c1'), model: 'Modelo renovado' } }])
+    await vi.waitFor(async () => {
+      expect((await listSessions()).find((item) => item.cloudId === 's1')?.name).toBe('Sesión renovada')
+      expect((await listComputers()).find((item) => item.cloudId === 'c1')?.model).toBe('Modelo renovado')
+    })
+    unsubscribe()
+  })
+
+  it('elimina documentos locales cuando Firestore notifica el borrado', async () => {
+    await pullCloudData('bob', { force: true })
+    const unsubscribe = subscribeToSharedInventory('bob', { onApplied: vi.fn(), onError: vi.fn() })
+    await emitRemoteChanges('inventoryComputers', [{ type: 'removed', id: 'c1' }])
+    await emitRemoteChanges('inventorySessions', [{ type: 'removed', id: 's1' }])
+    await vi.waitFor(async () => {
+      expect((await listComputers()).some((item) => item.cloudId === 'c1')).toBe(false)
+      expect((await listSessions()).some((item) => item.cloudId === 's1')).toBe(false)
+    })
+    unsubscribe()
+  })
+
+  it('no sobrescribe una edición local pendiente con una notificación remota', async () => {
+    await pullCloudData('alice', { force: true })
+    const current = (await listComputers()).find((item) => item.cloudId === 'c2')!
+    await saveComputer({ ...current, model: 'Edición local pendiente' })
+    const unsubscribe = subscribeToSharedInventory('alice', { onApplied: vi.fn(), onError: vi.fn() })
+    await emitRemoteChanges('inventoryComputers', [{ type: 'modified', id: 'c2', row: { ...store.data.get('inventoryComputers')!.get('c2'), model: 'Cambio remoto' } }])
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect((await listComputers()).find((item) => item.cloudId === 'c2')?.model).toBe('Edición local pendiente')
+    expect((await getPendingSyncQueue()).some((item) => item.entityId === current.id)).toBe(true)
+    unsubscribe()
+  })
+
+  it('cancela listeners al cerrar sesión y crea listeners limpios para otra cuenta', async () => {
+    const first = subscribeToSharedInventory('alice', { onApplied: vi.fn(), onError: vi.fn() })
+    expect(store.listeners.get('inventorySessions')?.size).toBe(1)
+    expect(store.listeners.get('inventoryComputers')?.size).toBe(1)
+    first()
+    expect(store.listeners.get('inventorySessions')?.size).toBe(0)
+    expect(store.listeners.get('inventoryComputers')?.size).toBe(0)
+    const second = subscribeToSharedInventory('bob', { onApplied: vi.fn(), onError: vi.fn() })
+    expect(store.listeners.get('inventorySessions')?.size).toBe(1)
+    expect(store.listeners.get('inventoryComputers')?.size).toBe(1)
+    second()
+  })
+
+  it('un listener cancelado deja de aplicar cambios', async () => {
+    const onApplied = vi.fn()
+    const unsubscribe = subscribeToSharedInventory('alice', { onApplied, onError: vi.fn() })
+    unsubscribe()
+    await emitRemoteChanges('inventoryComputers', [{ type: 'added', id: 'after-logout', row: { ...remoteComputer(901, 'bob', 's1'), id: 'after-logout' } }])
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(onApplied).not.toHaveBeenCalled()
+    expect((await listComputers()).some((item) => item.cloudId === 'after-logout')).toBe(false)
+  })
+
+  it('reanuda cambios al recuperar conexión sin duplicar registros', async () => {
+    const unsubscribe = subscribeToSharedInventory('bob', { onApplied: vi.fn(), onError: vi.fn() })
+    vi.stubGlobal('navigator', { onLine: false })
+    expect(await listComputers()).toHaveLength(0)
+    vi.stubGlobal('navigator', { onLine: true })
+    const row = { ...remoteComputer(902, 'alice', 's1'), id: 'reconnected', cloudId: 'reconnected' }
+    await emitRemoteChanges('inventoryComputers', [{ type: 'added', id: 'reconnected', row }])
+    await emitRemoteChanges('inventoryComputers', [{ type: 'modified', id: 'reconnected', row: { ...row, model: 'Final' } }])
+    await vi.waitFor(async () => expect((await listComputers()).filter((item) => item.cloudId === 'reconnected')).toHaveLength(1))
+    expect((await listComputers()).find((item) => item.cloudId === 'reconnected')?.model).toBe('Final')
+    unsubscribe()
   })
 })

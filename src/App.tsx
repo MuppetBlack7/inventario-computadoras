@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { onAuthStateChanged, signOut, type User } from 'firebase/auth'
 import { AuthSyncPanel } from './components/AuthSyncPanel'
 import { ComputerForm } from './components/ComputerForm'
@@ -14,7 +14,7 @@ import {
   listVisibleSessions,
   saveSession
 } from './db'
-import { migrateLegacyCloudData, pendingCount, pullCloudData, synchronize, verifyCloudOwnership, type SyncSummary } from './cloudSync'
+import { describeSyncError, migrateLegacyCloudData, pendingCount, pullCloudData, subscribeToSharedInventory, synchronize, synchronizeAndPull, verifyCloudOwnership, type SyncSummary } from './cloudSync'
 import { describeFirebaseAuthError, firebaseAuth, firebaseConfigured, prepareFirebaseAuth, signInWithGoogle } from './firebaseClient'
 import { imageKitConfigured } from './imageKitClient'
 import type { ComputerRecord, InventorySession, SyncStatus } from './types'
@@ -47,9 +47,12 @@ export default function App() {
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('local')
   const [syncMessage, setSyncMessage] = useState('Guardado local')
   const [pending, setPending] = useState(0)
+  const [isSyncing, setIsSyncing] = useState(false)
+  const [lastSuccessfulAt, setLastSuccessfulAt] = useState<string | null>(null)
   const [nextRetryAt, setNextRetryAt] = useState<number | null>(null)
   const [importPreview, setImportPreview] = useState<{ sessions: number; computers: number; photos: number } | null>(null)
   const [importBusy, setImportBusy] = useState(false)
+  const activeSyncRef = useRef<Promise<SyncSummary | undefined> | null>(null)
 
   const refresh = useCallback(async (ownerId: string | null) => {
     const [nextSessions, nextComputers, nextPending] = await Promise.all([
@@ -73,24 +76,58 @@ export default function App() {
     if (result.errors && result.lastError) setToast(`Sincronización pendiente: ${result.lastError}`)
   }, [])
 
-  const runSync = useCallback(async (activeUser: User | null = user, force = false) => {
+  const recordSuccessfulUpdate = useCallback((ownerId: string) => {
+    const value = new Date().toISOString()
+    setLastSuccessfulAt(value)
+    try { localStorage.setItem(`inventario.lastSuccessfulSync.${ownerId}`, value) } catch { /* almacenamiento bloqueado */ }
+  }, [])
+
+  const runSync = useCallback((activeUser: User | null = user, force = false) => {
     if (!activeUser) {
       reportSync('local', 'Guardado local')
-      return undefined
+      return Promise.resolve(undefined)
     }
-    try {
-      const result = await synchronize(activeUser.uid, reportSync, { force })
-      applySyncResult(result)
-      await pullCloudData(activeUser.uid)
-      await refresh(activeUser.uid)
-      return result
-    } catch (error) {
-      reportSync('error', 'Error al sincronizar')
-      setToast(error instanceof Error ? error.message : 'No fue posible sincronizar')
-      const pendingNow = await pendingCount(activeUser.uid)
-      return { synced: 0, errors: 1, photosLocalOnly: 0, pending: pendingNow, lastError: error instanceof Error ? error.message : 'No fue posible sincronizar' }
-    }
-  }, [applySyncResult, refresh, reportSync, user])
+    if (activeSyncRef.current) return activeSyncRef.current
+    const task = (async (): Promise<SyncSummary | undefined> => {
+      if (!navigator.onLine) {
+        reportSync('local', 'Sin conexión · guardado local')
+        await refresh(activeUser.uid)
+        return undefined
+      }
+      setIsSyncing(true)
+      reportSync('syncing', 'Sincronizando…')
+      try {
+        const result = await synchronizeAndPull(activeUser.uid, reportSync, { force })
+        applySyncResult(result)
+        await refresh(activeUser.uid)
+        if (result.errors) {
+          const message = result.lastError || 'Quedaron operaciones pendientes'
+          reportSync('error', `Error al sincronizar · ${message}`)
+          setToast(`Sincronización pendiente: ${message}`)
+        } else {
+          recordSuccessfulUpdate(activeUser.uid)
+          reportSync('synced', force ? 'Actualizado ahora' : 'Sincronizado')
+        }
+        return result
+      } catch (error) {
+        const message = describeSyncError(error)
+        console.error('No fue posible sincronizar el inventario', error)
+        reportSync('error', `Error al sincronizar · ${message}`)
+        setToast(message)
+        const pendingNow = await pendingCount(activeUser.uid)
+        await refresh(activeUser.uid)
+        return { synced: 0, errors: 1, photosLocalOnly: 0, pending: pendingNow, lastError: message }
+      }
+    })()
+    activeSyncRef.current = task
+    void task.finally(() => {
+      if (activeSyncRef.current === task) {
+        activeSyncRef.current = null
+        setIsSyncing(false)
+      }
+    })
+    return task
+  }, [applySyncResult, recordSuccessfulUpdate, refresh, reportSync, user])
 
   const afterLocalChange = useCallback(async () => {
     reportSync('local', 'Guardado local')
@@ -116,19 +153,20 @@ export default function App() {
     const applyUser = (nextUser: User | null) => {
       if (!active) return
       setUser(nextUser)
+      if (nextUser) {
+        try { setLastSuccessfulAt(localStorage.getItem(`inventario.lastSuccessfulSync.${nextUser.uid}`)) } catch { setLastSuccessfulAt(null) }
+      } else setLastSuccessfulAt(null)
       setAuthReady(true)
       void (async () => {
         if (nextUser) {
           reportSync('syncing', 'Sincronizando')
           try {
             await migrateLegacyCloudData(nextUser)
-            await pullCloudData(nextUser.uid)
             const preview = await getLocalImportPreview()
             if (preview.sessions || preview.computers) setImportPreview(preview)
             else {
               const result = await synchronize(nextUser.uid, reportSync)
               applySyncResult(result)
-              await pullCloudData(nextUser.uid)
             }
           } catch (error) {
             console.error('No fue posible recuperar o sincronizar el inventario al iniciar', error)
@@ -180,6 +218,25 @@ export default function App() {
       unsubscribe()
     }
   }, [applySyncResult, refresh, reportSync])
+
+  useEffect(() => {
+    const ownerId = user?.uid
+    if (!ownerId) return
+    return subscribeToSharedInventory(ownerId, {
+      onApplied: async (stats) => {
+        await refresh(ownerId)
+        recordSuccessfulUpdate(ownerId)
+        const changes = stats.sessions + stats.computers + stats.removed
+        reportSync('synced', changes === 1 ? 'Actualizado en tiempo real' : `Actualizado en tiempo real · ${changes} cambios`)
+      },
+      onError: (error) => {
+        const message = describeSyncError(error)
+        console.error('Listener de Firestore detenido', error)
+        reportSync('error', `Error de actualización · ${message}`)
+        setToast(message)
+      }
+    })
+  }, [recordSuccessfulUpdate, refresh, reportSync, user?.uid])
 
   useEffect(() => {
     const handleOnline = () => { if (user) void runSync(user) }
@@ -241,6 +298,8 @@ export default function App() {
           status={syncStatus}
           message={syncMessage}
           pending={pending}
+          isSyncing={isSyncing}
+          lastSuccessfulAt={lastSuccessfulAt}
           onLogin={() => void startGoogleLogin(setAuthError, setToast)}
           onLogout={() => { if (firebaseAuth) void signOut(firebaseAuth) }}
           onSync={() => void runSync(user, true)}

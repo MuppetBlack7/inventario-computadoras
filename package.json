@@ -7,7 +7,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
-    "test": "vitest run src/inventory.test.ts src/cloudSync.test.ts src/cloudSync.unconfigured.test.ts",
+    "test": "vitest run src/inventory.test.ts src/cloudSync.test.ts src/cloudSync.unconfigured.test.ts src/syncUi.test.tsx",
     "test:rules": "vitest run src/firestore.rules.test.ts",
     "test:rules:emulator": "firebase emulators:exec --only firestore --project inventario-computadoras-rules-test \"npm run test:rules\"",
     "test:watch": "vitest",

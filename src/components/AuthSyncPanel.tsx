@@ -7,12 +7,14 @@ interface Props {
   status: SyncStatus
   message: string
   pending: number
+  isSyncing: boolean
+  lastSuccessfulAt: string | null
   onLogin: () => void
   onLogout: () => void
   onSync: () => void
 }
 
-export function AuthSyncPanel({ configured, user, status, message, pending, onLogin, onLogout, onSync }: Props) {
+export function AuthSyncPanel({ configured, user, status, message, pending, isSyncing, lastSuccessfulAt, onLogin, onLogout, onSync }: Props) {
   if (!configured) return <div className="sync-chip status-local"><span />Firebase pendiente</div>
   if (!user) return <button className="auth-button" onClick={onLogin}><span className="google-mark">G</span> Iniciar sesión</button>
   return (
@@ -25,7 +27,15 @@ export function AuthSyncPanel({ configured, user, status, message, pending, onLo
       <div className="account-popover">
         <strong>{user.displayName || 'Cuenta Google'}</strong>
         <span>{user.email}</span>
-        <button className="secondary-button full-width" onClick={onSync}>Sincronizar ahora</button>
+        <div className={`sync-detail status-${status}`} role="status" aria-live="polite">
+          <span className="sync-dot" />
+          <div><strong>{message}</strong><small>{pending ? `${pending} ${pending === 1 ? 'operación pendiente' : 'operaciones pendientes'}` : 'Sin operaciones pendientes'}</small></div>
+        </div>
+        {lastSuccessfulAt && <small className="last-sync-time">Última actualización correcta: {new Date(lastSuccessfulAt).toLocaleString('es-MX', { dateStyle: 'short', timeStyle: 'short' })}</small>}
+        <button className="secondary-button full-width sync-now-button" disabled={isSyncing} aria-busy={isSyncing} onClick={onSync}>
+          {isSyncing && <span className="button-spinner" aria-hidden="true" />}
+          {isSyncing ? 'Sincronizando…' : 'Sincronizar ahora'}
+        </button>
         <button className="text-button full-width" onClick={onLogout}>Cerrar sesión</button>
       </div>
     </details>
