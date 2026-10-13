@@ -1,6 +1,7 @@
 import { openDB, type DBSchema, type IDBPObjectStore, type IDBPTransaction } from 'idb'
 import type { ComputerRecord, ImageKitPhotoReference, InventorySession, PhotoCleanupReason, SyncQueueItem, SyncStatus } from './types'
 import { normalizeKey } from './utils'
+import { cleanupLocalState } from './cleanupIdentity'
 
 interface InventoryDB extends DBSchema {
   sessions: {
@@ -676,6 +677,43 @@ export async function removeRemoteMirroredComputer(id: string, cloudId?: string)
   await transaction.objectStore('computers').delete(id)
   await transaction.done
   return true
+}
+
+/**
+ * Retira SOLO la copia local de un equipo ya verificado en Firebase («Limpiar copias locales verificadas»).
+ * No encola nada, no toca Firestore, ImageKit, sesiones ni otras tiendas. Dentro de la misma transacción vuelve a comprobar que
+ * el registro no cambió y que ninguna operación de la cola lo menciona; ante cualquier duda lo conserva.
+ */
+export async function removeLocalComputerCopy(id: string, expected: { updatedAt: string; ownerId?: string; cloudId?: string; photoLocalRevision?: string; photoSize: number | null; photoRemoteFileId?: string; localState?: string; localPhotoSha256?: string }, currentUserId?: () => string | null | undefined): Promise<'removed' | 'absent' | 'changed' | 'queued'> {
+  const database = await getDatabase()
+  if (expected.localPhotoSha256) {
+    const before = await database.get('computers', id)
+    if (before) {
+      if (!before.photo) return 'changed'
+      const digest = await crypto.subtle.digest('SHA-256', await before.photo.arrayBuffer())
+      const hash = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+      if (hash !== expected.localPhotoSha256) return 'changed'
+    }
+  }
+  const transaction = database.transaction(['computers', 'syncQueue'], 'readwrite')
+  const computers = transaction.objectStore('computers')
+  const current = await computers.get(id)
+  if (!current) { await transaction.done; return 'absent' }
+  const unchanged = Boolean(expected.ownerId) && current.updatedAt === expected.updatedAt && current.ownerId === expected.ownerId && current.syncStatus === 'synced'
+    && (expected.cloudId === undefined || current.cloudId === expected.cloudId)
+    && (!expected.localState || cleanupLocalState(current) === expected.localState)
+    && current.photoLocalRevision === expected.photoLocalRevision && (current.photo?.size ?? null) === expected.photoSize
+    && current.photoRemote?.fileId === expected.photoRemoteFileId && !current.photoNeedsUpload
+    && !['pending', 'uploading', 'error'].includes(current.photoUploadStatus ?? '')
+  if (!unchanged) { await transaction.done; return 'changed' }
+  const queue = await transaction.objectStore('syncQueue').getAll()
+  const queued = queue.some((item) => [item.entityId, item.remoteId].some((value) => value && (value === current.id || value === current.cloudId))
+    || Boolean(current.photoRemote?.fileId && (item.photoFileId === current.photoRemote.fileId || item.photoCandidate?.fileId === current.photoRemote.fileId)))
+  if (queued) { await transaction.done; return 'queued' }
+  if (currentUserId && currentUserId() !== expected.ownerId) { await transaction.done; return 'changed' }
+  await computers.delete(id)
+  await transaction.done
+  return 'removed'
 }
 
 export async function removeRemoteMirroredSession(id: string, cloudId?: string) {

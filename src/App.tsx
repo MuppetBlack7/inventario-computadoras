@@ -21,11 +21,12 @@ import {
   saveSession
 } from './db'
 import { downloadRemotePhoto, imageKitConfigured } from './imageKitClient'
-import { enqueueOwnUploads, getPendingSyncQueue } from './db'
+import { enqueueOwnUploads, getPendingSyncQueue, removeLocalComputerCopy } from './db'
 import { describeSyncError, failedCount, pendingCount, pullCloudData, subscribeToSharedInventory, synchronize, synchronizeAndPull, type SyncSummary } from './cloudSync'
 import type { ControlRun } from './components/RecoveryControls'
 import { previewControl, type ControlId } from './recoveryPermissions'
-import { runRecoveryDiagnostic } from './recovery'
+import { readLocalRecoverySnapshot, readRemoteRecoverySnapshot, runRecoveryDiagnostic } from './recovery'
+import { planLocalCleanup, runLocalCleanup, type CleanupPlan, type CleanupResult } from './localCleanup'
 import { afterDiagnostic, appUsable, authorizeRecovery, CHECKING, keepSyncStopped, mergeDiagnostic, syncAllowed, type RecoveryState } from './recoveryState'
 import { authLog, describeFirebaseAuthError, firebaseAuth, firebaseConfigured, prepareFirebaseAuth, signInWithGoogle } from './firebaseClient'
 import type { ComputerRecord, InventorySession, SyncStatus } from './types'
@@ -339,10 +340,35 @@ export default function App() {
     if (view.name === 'sync' && user && (flowRef.current.step === 'overview' || flowRef.current.step === 'result')) void compareNow()
   }, [view.name, user?.uid, compareNow])
 
-  /**
-   * Botón «Sincronizar ahora» del menú de perfil: abre «Sincronizar inventario» y empieza por la comparación de solo lectura.
-   * No ejecuta ninguna sincronización: las escrituras solo ocurren tras la confirmación explícita del flujo.
-   */
+  /** Limpieza de copias locales verificadas: solo lectura hasta la segunda confirmación; nunca escribe en Firebase ni ImageKit. */
+  const cleanupDeps = (accountId: string) => ({
+    currentUserId: () => firebaseAuth?.currentUser?.uid,
+    readLocal: readLocalRecoverySnapshot,
+    readRemote: readRemoteRecoverySnapshot,
+    loadRemote: online && imageKitConfigured ? downloadRemotePhoto : undefined,
+    removeCopy: (item: { id: string; expect?: Parameters<typeof removeLocalComputerCopy>[1] }) => removeLocalComputerCopy(item.id, item.expect!, () => firebaseAuth?.currentUser?.uid),
+    log: (result: CleanupResult) => {
+      try {
+        const key = 'inventario.localCleanupLog'
+        const previous = JSON.parse(localStorage.getItem(key) || '[]') as CleanupResult[]
+        localStorage.setItem(key, JSON.stringify([...previous.slice(-19), { ...result, accountId }]))
+      } catch { /* el registro es opcional */ }
+    }
+  })
+  const previewLocalCleanup = async (): Promise<CleanupPlan> => {
+    if (!user) throw new Error('Inicia sesión para revisar las copias locales.')
+    const accountId = user.uid
+    let remote = null
+    try { remote = await readRemoteRecoverySnapshot() } catch { /* se informa como lectura fallida */ }
+    return planLocalCleanup({ local: await readLocalRecoverySnapshot(), remote, accountId, authUid: firebaseAuth?.currentUser?.uid, loadRemote: online && imageKitConfigured ? downloadRemotePhoto : undefined })
+  }
+  const runCleanup = async (plan: CleanupPlan): Promise<CleanupResult> => {
+    const result = await runLocalCleanup(plan, true, cleanupDeps(plan.accountId))
+    if (user) { await refresh(user.uid); void inspectRecovery(user.uid) }
+    return result
+  }
+
+  /** El botón del perfil abre la comparación de solo lectura; no ejecuta ninguna sincronización. */
   const openSyncReview = () => {
     dispatchFlow({ type: 'sync-now' })
     setView({ name: 'sync' })
@@ -543,7 +569,7 @@ export default function App() {
       ) : (
         <>
           {view.name === 'sync' && (recovery.report && recovery.local
-            ? <SyncInventoryView report={recovery.report} local={recovery.local} remote={recovery.remote || null} online={online} display={syncDisplay} imageKitConfigured={imageKitConfigured} loadRemotePhoto={online && imageKitConfigured ? downloadRemotePhoto : undefined} flow={flow} onFlow={dispatchFlow} result={syncResult} message={controlMessage} onBack={() => setView({ name: 'sessions' })} onAuthorize={authorizeSync} onRetry={() => void inspectRecovery(user.uid)} busyControl={controlBusy} controlMessage={controlMessage} onRunControl={(run) => void runControl(run)} />
+            ? <SyncInventoryView report={recovery.report} local={recovery.local} remote={recovery.remote || null} online={online} display={syncDisplay} imageKitConfigured={imageKitConfigured} loadRemotePhoto={online && imageKitConfigured ? downloadRemotePhoto : undefined} onCleanupPreview={previewLocalCleanup} onCleanupRun={runCleanup} flow={flow} onFlow={dispatchFlow} result={syncResult} message={controlMessage} onBack={() => setView({ name: 'sessions' })} onAuthorize={authorizeSync} onRetry={() => void inspectRecovery(user.uid)} busyControl={controlBusy} controlMessage={controlMessage} onRunControl={(run) => void runControl(run)} />
             : <main className="screen sync-screen"><h1>Sincronizar inventario</h1><p>{recovery.phase === 'checking' ? 'Comparando con Firebase en solo lectura…' : 'No se pudo leer el estado.'}</p><button className="secondary-button" onClick={() => void inspectRecovery(user.uid)}>Reintentar comparación</button><button className="primary-button" onClick={() => setView({ name: 'sessions' })}>Volver al inventario</button></main>)}
           {view.name === 'sessions' && <SessionsScreen
             sessions={sessions}

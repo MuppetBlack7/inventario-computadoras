@@ -2,6 +2,8 @@ import type { ReactNode } from 'react'
 import type { RecoveryReport, RecoverySnapshot, RemoteRecoverySnapshot } from '../recovery'
 import { advance, type FlowAction, type FlowState } from '../syncFlow'
 import { PhotoCheckPanel } from './PhotoCheckPanel'
+import { LocalCleanupCard } from './LocalCleanupCard'
+import type { CleanupPlan, CleanupResult } from '../localCleanup'
 import type { RemoteLoader } from '../photoCheck'
 import { buildProposal, describeDifferences, explainNoOperations, isUpToDate, primaryAction, summarizePending, summarizeSync, type RecordChoice, type RowRef, type SyncDecisions, type SyncProposal } from '../syncPlan'
 import { RecoveryView } from './RecoveryView'
@@ -39,6 +41,9 @@ interface Props {
   onRunControl?: (run: ControlRun) => void
   /** Lector de solo lectura (a memoria) de la fotografía remota para la comprobación de identidad; sin él queda «No verificada». */
   loadRemotePhoto?: RemoteLoader
+  /** Limpieza de copias locales verificadas: acción separada de la sincronización. */
+  onCleanupPreview?: () => Promise<CleanupPlan>
+  onCleanupRun?: (plan: CleanupPlan) => Promise<CleanupResult>
 }
 
 /** Tener internet no significa haber sincronizado: estos textos solo describen la conexión. */
@@ -225,6 +230,8 @@ export function SyncInventoryView(props: Props) {
       </> : <p>Sin resultado.</p>}
       <div className="button-row"><button className="secondary-button" onClick={() => onFlow({ type: 'back' })}>Volver al resumen</button><button className="secondary-button" onClick={() => onFlow({ type: 'sync-now' })}>Sincronizar de nuevo</button><button className="primary-button" onClick={props.onBack}>Volver al inventario</button></div>
     </div>}
+
+    {flow.step === 'overview' && props.onCleanupPreview && props.onCleanupRun && <LocalCleanupCard online={online} onPreview={props.onCleanupPreview} onRun={props.onCleanupRun} />}
 
     <details className="tool-card">
       <summary>Detalles técnicos y herramientas avanzadas</summary>
