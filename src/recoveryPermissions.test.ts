@@ -94,6 +94,24 @@ describe('alcances separados de la recuperación', () => {
     expect(evaluate(local, remote, false).decisions['upload-own-photos']).toMatchObject({ allowed: false, blockedBy: ['imagekit-not-configured'] })
   })
 
+  it('permite procesar una fotografía seleccionada por esta cuenta en un equipo de otra cuenta sin habilitar cambios generales', () => {
+    const shared = computer('shared', {
+      ownerId: 'bob', cloudId: 'shared', sharedCloud: true, photo: photo(), photoNeedsUpload: true,
+      photoUploadStatus: 'pending', photoPendingActorId: 'alice', photoLocalRevision: 'photo-r1'
+    })
+    const queued = op('shared', { id: 'computer-photo:shared', operation: 'update-computer-photo', ownerId: 'alice', recordOwnerId: 'bob', remoteId: 'shared', photoSourceRevision: 'photo-r1' })
+    const local = snap([shared], [queued])
+    const remote = remoteOf([{ ...shared, photo: undefined, photoNeedsUpload: false, photoUploadStatus: undefined, photoPendingActorId: undefined, photoLocalRevision: undefined }])
+    const ready = evaluate(local, remote, true)
+    expect(ready.decisions['upload-own-photos'].allowed).toBe(true)
+    expect(ready.report.rows.find((row) => row.localId === 'shared')?.categories).not.toContain('foreign-pending-operation')
+    expect(ready.preview('upload-own-photos').items).toEqual([
+      { action: 'upload-photo', kind: 'computer', id: 'shared', detail: '3 bytes' },
+      { action: 'update-photo-reference', kind: 'computer', id: 'shared', detail: 'solo cambia la referencia de fotografía; propietario y demás datos permanecen intactos' }
+    ])
+    expect(ready.preview('push-own').items).toEqual([])
+  })
+
   it('sin fotos propias que subir el alcance de fotos no tiene nada que habilitar', () => {
     const { local, remote } = observed()
     expect(evaluate(local, remote).decisions['upload-own-photos']).toMatchObject({ allowed: false, blockedBy: ['nothing-to-upload'] })

@@ -24,13 +24,13 @@ async function authenticatedFetch(path: string, init: RequestInit = {}) {
   return response
 }
 
-export async function uploadPhotoToImageKit(computerId: string, photo: Blob, fileName = 'foto.jpg') {
+export async function uploadPhotoToImageKit(computerId: string, photo: Blob, fileName = 'foto.jpg', uploadKey = computerId) {
   if (!imageKitConfigured) throw new Error('ImageKit está pendiente de configurar')
   if (!['image/jpeg', 'image/png', 'image/webp'].includes(photo.type)) throw new Error('Formato de fotografía no admitido')
   if (photo.size > 5 * 1024 * 1024) throw new Error('La fotografía supera el límite de 5 MB')
   const response = await authenticatedFetch(`/upload?computerId=${encodeURIComponent(computerId)}`, {
     method: 'POST',
-    headers: { 'Content-Type': photo.type, 'X-File-Name': encodeURIComponent(fileName) },
+    headers: { 'Content-Type': photo.type, 'X-File-Name': encodeURIComponent(fileName), 'X-Upload-Key': uploadKey },
     body: photo
   })
   return await response.json() as ImageKitPhotoReference

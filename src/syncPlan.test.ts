@@ -71,7 +71,7 @@ describe('propuesta de sincronización', () => {
     expect(result.steps).toEqual({ enqueue: [], download: [], upload: [], photos: [] })
     expect(result.runDownload || result.runUpload || result.runPhotos).toBe(false)
     expect(result.allowed).toBe(false)
-    expect(result.kept.filter((item) => item.detail?.includes('solo su propietario puede subirla')).map((item) => item.id).sort()).toEqual(['stuck-0150430', 'stuck-0447137'])
+    expect(result.kept.filter((item) => item.detail?.includes('puede reemplazarse seleccionando una nueva')).map((item) => item.id).sort()).toEqual(['stuck-0150430', 'stuck-0447137'])
     expect(local.computers.filter((item) => item.importedFrom).every((item) => item.ownerId === 'alice')).toBe(true)
   })
 

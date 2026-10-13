@@ -9,6 +9,7 @@ import { advance, initialFlow, type FlowAction, type FlowState } from './syncFlo
 import { buildProposal, describeOperationResults, type SyncProposal } from './syncPlan'
 import { ComputerForm } from './components/ComputerForm'
 import { PhotoPreview } from './components/PhotoPreview'
+import { PhotoUpdateForm } from './components/PhotoUpdateForm'
 import { DatabaseBackupIcon } from './components/NavIcons'
 import { BottomNav, viewForNav } from './components/BottomNav'
 import { SyncAlertBar } from './components/SyncAlertBar'
@@ -44,6 +45,7 @@ type View =
   | { name: 'inventory'; sessionId: string }
   | { name: 'scanner'; sessionId?: string }
   | { name: 'form'; computer: ComputerRecord }
+  | { name: 'photo'; computer: ComputerRecord }
   | { name: 'detail'; computerId: string }
   | { name: 'backup' }
   | { name: 'sync' }
@@ -508,6 +510,8 @@ export default function App() {
     ? view.sessionId
     : view.name === 'form'
       ? view.computer.sessionId
+      : view.name === 'photo'
+        ? view.computer.sessionId
       : view.name === 'detail'
         ? computers.find((item) => item.id === view.computerId)?.sessionId
         : undefined
@@ -612,11 +616,22 @@ export default function App() {
               setView({ name: 'detail', computerId: saved.id })
             }}
           />}
+          {view.name === 'photo' && <PhotoUpdateForm
+            initial={view.computer}
+            actorId={user.uid}
+            onCancel={() => setView({ name: 'detail', computerId: view.computer.id })}
+            onSaved={async (saved) => {
+              const result = await afterLocalChange()
+              setToast(syncToast(result, { synced: 'Fotografía sincronizada', local: 'Fotografía guardada localmente', failed: 'Fotografía guardada localmente; quedó pendiente de sincronizar' }))
+              setView({ name: 'detail', computerId: saved.id })
+            }}
+          />}
           {view.name === 'detail' && <DetailScreen
             computer={computers.find((computer) => computer.id === view.computerId)}
             session={sessions.find((session) => session.id === computers.find((computer) => computer.id === view.computerId)?.sessionId)}
             onBack={(sessionId) => setView({ name: 'inventory', sessionId })}
             onEdit={(computer) => setView({ name: 'form', computer })}
+            onEditPhoto={(computer) => setView({ name: 'photo', computer })}
             currentUserId={user.uid}
             onDeleted={async (sessionId) => {
               const result = await afterLocalChange()
@@ -829,11 +844,12 @@ interface DetailProps {
   session?: InventorySession
   onBack: (sessionId: string) => void
   onEdit: (computer: ComputerRecord) => void
+  onEditPhoto: (computer: ComputerRecord) => void
   onDeleted: (sessionId: string) => Promise<void>
   currentUserId: string
 }
 
-function DetailScreen({ computer, session, onBack, onEdit, onDeleted, currentUserId }: DetailProps) {
+function DetailScreen({ computer, session, onBack, onEdit, onEditPhoto, onDeleted, currentUserId }: DetailProps) {
   if (!computer) return <main className="screen"><p>El registro ya no existe.</p></main>
   const canModify = computer.ownerId === currentUserId
   const remove = async () => {
@@ -851,6 +867,8 @@ function DetailScreen({ computer, session, onBack, onEdit, onDeleted, currentUse
         <PhotoPreview blob={computer.photo} remote={computer.photoRemote} computerId={computer.cloudId || computer.id} alt="Fotografía del equipo" className="detail-photo" unavailableOnDevice={!computer.photo && Boolean(computer.photoStoredLocally || computer.photoPath)} />
         <div><span className="badge">{computer.isExample ? 'DATO DE EJEMPLO' : 'REGISTRO'}</span><SyncBadge status={computer.syncStatus} /><h2>{displayEquipmentType(computer) || 'Tipo de equipo no indicado'}</h2><p>{computer.brand || 'Marca no indicada'} {computer.model}</p>{computer.photoNeedsUpload && <p className="local-photo-label">Fotografía local · pendiente de subir</p>}{computer.photoRemote && !computer.photoNeedsUpload && <p className="local-photo-label">Fotografía privada sincronizada</p>}{computer.photoUploadError && <p className="local-photo-label">Error de fotografía: {computer.photoUploadError}</p>}</div>
       </section>
+      {!computer.photo && !computer.photoRemote && Boolean(computer.photoStoredLocally || computer.photoPath) && <p className="inline-note warning-box">La fotografía anterior no está disponible en este dispositivo. Puedes reemplazarla subiendo una nueva.</p>}
+      {(computer.sharedCloud || computer.cloudId) && <button className="secondary-button" onClick={() => onEditPhoto(computer)}>{computer.photo || computer.photoRemote ? 'Reemplazar fotografía' : 'Subir fotografía'}</button>}
       <section className="detail-section">
         <div className="section-row"><h2>Información</h2>{canModify ? <button className="ghost-button" onClick={() => onEdit(computer)}>Editar</button> : <span className="readonly-label">Solo el creador puede editar</span>}</div>
         <dl className="detail-grid">

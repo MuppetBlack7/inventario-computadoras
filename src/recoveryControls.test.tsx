@@ -69,7 +69,7 @@ describe('los cuatro controles de la pantalla de recuperación', () => {
     expect(html).toContain('upload-photo')
     expect(html).toContain('3 bytes')
     expect(html).toContain('Excluido: 1')
-    expect(html).toContain('solo su propietario puede subirla')
+    expect(html).toContain('puede reemplazarse seleccionando una nueva')
     expect(html).toContain('Confirmar: Actualizar fotografías')
     expect(html).not.toContain('Confirmar: Actualizar todos los equipos')
   })

@@ -48,6 +48,8 @@ export const getDatabase = () =>
 const queueKey = (operation: SyncQueueItem['operation'], entityId: string, photoFileId?: string) =>
   operation === 'cleanup-photo'
     ? `photo:${photoFileId || entityId}`
+    : operation === 'update-computer-photo'
+      ? `computer-photo:${entityId}`
     : `${operation.includes('session') ? 'session' : 'computer'}:${entityId}`
 
 const queueItem = (operation: SyncQueueItem['operation'], entityId: string, ownerId?: string, remoteId?: string, photoFileId?: string, previous?: SyncQueueItem, extras: Partial<SyncQueueItem> = {}): SyncQueueItem => ({
@@ -203,7 +205,10 @@ const buildPreparedComputer = (computer: ComputerRecord, photo: Blob | undefined
     updatedAt: enqueue ? new Date().toISOString() : computer.updatedAt,
     syncStatus: enqueue ? 'local' : computer.syncStatus,
     syncError: enqueue ? undefined : computer.syncError,
-    photoLocalRevision: localPhotoRevision
+    photoLocalRevision: localPhotoRevision,
+    photoPendingActorId: computer.photoNeedsUpload && photo
+      ? computer.photoPendingActorId || computer.ownerId
+      : computer.photoPendingActorId
   }
 }
 
@@ -248,6 +253,48 @@ export async function saveComputer(computer: ComputerRecord, enqueue = true) {
   return prepared
 }
 
+/** Guarda solo una nueva fotografía para un equipo remoto, sin cambiar su propietario ni los demás campos. */
+export async function saveSharedComputerPhoto(computer: ComputerRecord, actorId: string) {
+  if (!computer.ownerId) throw new LocalSaveError('El registro no tiene propietario válido.')
+  if (!computer.cloudId && !computer.sharedCloud) throw new LocalSaveError('El equipo debe estar sincronizado antes de reemplazar su fotografía.')
+  if (!computer.photo) throw new LocalSaveError('Selecciona una fotografía antes de guardar.')
+  const photo = await preparePhotoForStorage(computer.photo)
+  const prepared: ComputerRecord = {
+    ...computer,
+    photo,
+    updatedAt: new Date().toISOString(),
+    syncStatus: 'local',
+    syncError: undefined,
+    photoStoredLocally: true,
+    photoNeedsUpload: true,
+    photoUploadStatus: 'pending',
+    photoUploadError: undefined,
+    photoPendingActorId: actorId,
+    photoLocalRevision: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`
+  }
+  let transaction: IDBPTransaction<InventoryDB, ['computers', 'syncQueue'], 'readwrite'> | undefined
+  try {
+    const database = await getDatabase()
+    transaction = database.transaction(['computers', 'syncQueue'], 'readwrite')
+    const done = transaction.done
+    done.catch(() => undefined)
+    await transaction.objectStore('computers').put(prepared)
+    const queue = transaction.objectStore('syncQueue')
+    const key = queueKey('update-computer-photo', prepared.id)
+    const previous = await queue.get(key)
+    await queue.put(queueItem('update-computer-photo', prepared.id, actorId, prepared.cloudId, prepared.photoRemote?.fileId, previous, {
+      sessionId: prepared.sessionId,
+      recordOwnerId: prepared.ownerId,
+      photoSourceRevision: prepared.photoLocalRevision
+    }))
+    await done
+    return prepared
+  } catch (error) {
+    try { transaction?.abort() } catch { /* la transacción ya terminó o se abortó */ }
+    throw describeStorageFailure(error)
+  }
+}
+
 const enqueueComputerDelete = async (queue: QueueStore, id: string, ownerId: string | undefined, existing: ComputerRecord | undefined) => {
   const key = queueKey('delete-computer', id)
   const previous = await queue.get(key)
@@ -290,7 +337,7 @@ export async function findDuplicates(inventoryId: string, serialNumber: string, 
   return [...found.values()]
 }
 
-export const PHOTO_FIELDS = ['photo', 'photoName', 'photoRemote', 'photoStoredLocally', 'photoNeedsUpload', 'photoUploadStatus', 'photoUploadError', 'photoLocalRevision', 'photoPath'] as const
+export const PHOTO_FIELDS = ['photo', 'photoName', 'photoRemote', 'photoStoredLocally', 'photoNeedsUpload', 'photoUploadStatus', 'photoUploadError', 'photoPendingActorId', 'photoLocalRevision', 'photoPath'] as const
 
 export interface RestoreBatch {
   sessions: Array<{ record: InventorySession; expectedUpdatedAt: string | null }>
@@ -469,6 +516,11 @@ export async function savePhotoCandidate(item: SyncQueueItem, photoCandidate: Im
     await transaction.done
     return true
   }
+  // Una actualización compartida nunca elimina automáticamente archivos: otra revisión conserva su propia cola.
+  if (item.operation === 'update-computer-photo') {
+    await transaction.done
+    return false
+  }
   const cleanupKey = queueKey('cleanup-photo', item.entityId, photoCandidate.fileId)
   const previousCleanup = await queue.get(cleanupKey)
   await queue.put(queueItem('cleanup-photo', item.entityId, item.ownerId, item.remoteId, photoCandidate.fileId, previousCleanup, {
@@ -537,7 +589,7 @@ export async function updateComputerSyncState(id: string, status: SyncStatus, er
   await transaction.done
 }
 
-export async function updateComputerPhotoState(id: string, changes: Partial<Pick<ComputerRecord, 'photoRemote' | 'photoNeedsUpload' | 'photoUploadStatus' | 'photoUploadError'>>) {
+export async function updateComputerPhotoState(id: string, changes: Partial<Pick<ComputerRecord, 'photoRemote' | 'photoNeedsUpload' | 'photoUploadStatus' | 'photoUploadError' | 'photoPendingActorId'>>) {
   const database = await getDatabase()
   const transaction = database.transaction('computers', 'readwrite')
   const computer = await transaction.store.get(id)
@@ -548,7 +600,7 @@ export async function updateComputerPhotoState(id: string, changes: Partial<Pick
 export async function queueLocalPhotoMigrations(ownerId: string) {
   const computers = await listComputers()
   let queued = 0
-  for (const computer of computers.filter((item) => item.ownerId === ownerId && item.photo && !item.photoRemote)) {
+  for (const computer of computers.filter((item) => item.ownerId === ownerId && (!item.photoPendingActorId || item.photoPendingActorId === ownerId) && item.photo && !item.photoRemote)) {
     await saveComputer({ ...computer, photoNeedsUpload: true, photoUploadStatus: 'pending', photoUploadError: undefined }, true)
     queued += 1
   }
@@ -614,7 +666,11 @@ export async function enqueueOwnUploads(ownerId: string, ids: readonly string[])
  * remotos antiguos. Devuelven false cuando el registro tiene una operación local pendiente y se conserva intacto.
  */
 const pendingFor = async (queue: QueueStore, kind: 'session' | 'computer', ids: Array<string | undefined>) => {
-  for (const id of ids) if (id && await queue.get(`${kind}:${id}`)) return true
+  for (const id of ids) {
+    if (!id) continue
+    if (await queue.get(`${kind}:${id}`)) return true
+    if (kind === 'computer' && await queue.get(`computer-photo:${id}`)) return true
+  }
   return false
 }
 
@@ -655,6 +711,7 @@ export async function applyRemoteComputer(remote: ComputerRecord) {
     photoNeedsUpload: keepLocalPhoto ? current?.photoNeedsUpload : false,
     photoUploadStatus: remote.photoRemote ? 'uploaded' : keepLocalPhoto ? current?.photoUploadStatus : undefined,
     photoUploadError: keepLocalPhoto ? current?.photoUploadError : undefined,
+    photoPendingActorId: keepLocalPhoto ? current?.photoPendingActorId : undefined,
     photoLocalRevision: keepLocalPhoto ? current?.photoLocalRevision : undefined,
     inventoryNormalized: normalizeKey(remote.inventoryId),
     serialNormalized: normalizeKey(remote.serialNumber),

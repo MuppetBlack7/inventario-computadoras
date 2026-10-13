@@ -142,7 +142,7 @@ describe('las 2 fotografías de otra cuenta no bloquean operaciones propias segu
     expect(proposal.steps.upload.map((item) => item.id)).toEqual(['mine'])
     const everything = [...proposal.steps.enqueue, ...proposal.steps.download, ...proposal.steps.upload, ...proposal.steps.photos].map((item) => item.id)
     expect(everything.some((id) => id.startsWith('stuck-'))).toBe(false)
-    expect(proposal.kept.filter((item) => item.id.startsWith('stuck-')).map((item) => item.detail)).toEqual(['fotografía de otra cuenta: solo su propietario puede subirla', 'fotografía de otra cuenta: solo su propietario puede subirla'])
+    expect(proposal.kept.filter((item) => item.id.startsWith('stuck-')).map((item) => item.detail)).toEqual(['fotografía pendiente en otro dispositivo: puede reemplazarse seleccionando una nueva en este dispositivo', 'fotografía pendiente en otro dispositivo: puede reemplazarse seleccionando una nueva en este dispositivo'])
   })
 
   it('no se marcan como recuperadas: siguen apareciendo como pendientes de otra cuenta', () => {

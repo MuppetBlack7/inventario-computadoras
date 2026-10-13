@@ -64,7 +64,7 @@ export interface RecoveryReport {
 
 const ignored = new Set([
   'photo', 'syncStatus', 'syncError', 'sharedCloud', 'photoNeedsUpload', 'photoUploadStatus',
-  'photoUploadError', 'photoLocalRevision', 'photoStoredLocally', 'photoPath', 'ownerName',
+  'photoUploadError', 'photoPendingActorId', 'photoLocalRevision', 'photoStoredLocally', 'photoPath', 'ownerName',
   'ownerEmail', 'updatedAt', 'createdAt', 'id', 'cloudId'
 ])
 
@@ -140,7 +140,8 @@ export function buildRecoveryReport(local: RecoverySnapshot, remote: RemoteRecov
     const changed = entry && match ? differences(entry, match) : []
     const ownerClass = classifyOwner(entry?.ownerId, match?.ownerId, Boolean(entry), Boolean(match), accountId)
     const recordOwner = entry?.ownerId ?? match?.ownerId
-    const foreignPending = pending.some((item) => item.foreign) || Boolean(pending.length && recordOwner && recordOwner !== accountId)
+    const authorizedPhotoPending = pending.some((item) => item.operation === 'update-computer-photo' && item.ownerId === accountId)
+    const foreignPending = pending.some((item) => item.foreign) || Boolean(pending.length && recordOwner && recordOwner !== accountId && !authorizedPhotoPending)
     const categories: RecoveryClassification[] = []
     if (entry && match) categories.push('exact-id')
     else if (entry && candidates.length) categories.push('probable-duplicate')
@@ -246,7 +247,9 @@ export function describeReviewReasons(local: RecoverySnapshot, remote: RemoteRec
     if (row.categories.includes('probable-duplicate')) mark('probable-duplicate', 'none')
     if (Boolean(row.localId) && !row.categories.includes('exact-id') && !row.categories.includes('probable-duplicate')) mark('not-matched')
     if (row.differences.length > 0) mark('different')
-    if (Boolean(row.localId) && row.categories.includes('photo-pending')) mark(!owner ? 'photo-pending-no-owner' : actor === 'this-account' ? 'photo-pending-own' : 'photo-pending-other-account')
+    const localComputer = row.localId ? local.computers.find((computer) => computer.id === row.localId) : undefined
+    const photoActor = localComputer?.photoPendingActorId
+    if (Boolean(row.localId) && row.categories.includes('photo-pending')) mark(!owner ? 'photo-pending-no-owner' : actor === 'this-account' || photoActor === report.accountId ? 'photo-pending-own' : 'photo-pending-other-account')
     // Cualquier otra causa que haya marcado la fila para revisión manual y no esté explicada arriba.
     if (row.categories.includes('manual-review') && !flagged && !local.queue.length) mark('manual-review', 'none')
   }

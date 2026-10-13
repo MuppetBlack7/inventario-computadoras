@@ -36,7 +36,7 @@ export const isAllowedOrigin = (origin: string) => !origin || ALLOWED_ORIGINS.ha
 
 const corsHeaders = (origin: string) => ({
   ...(ALLOWED_ORIGINS.has(origin) ? { 'Access-Control-Allow-Origin': origin } : {}),
-  'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-File-Name',
+  'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-File-Name, X-Upload-Key',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Cache-Control': 'no-store',
   Vary: 'Origin'
@@ -99,41 +99,91 @@ export function isSafePhotoPath(filePath: string, ownerId: string) {
 
 const imageKitAuthHeader = (privateKey: string) => `Basic ${btoa(`${privateKey}:`)}`
 
-async function imageKitUpload(request: Request, uid: string, computerId: string, env: Env): Promise<PhotoReference> {
+const sha256 = async (value: string) => hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))
+
+export async function buildIdempotentUploadName(uid: string, computerId: string, uploadKey: string, contentFingerprint: string, extension: string) {
+  return `${computerId}-${await sha256(`${uid}:${computerId}:${uploadKey}:${contentFingerprint}`)}.${extension}`
+}
+
+type ImageKitFile = {
+  fileId?: string
+  filePath?: string
+  name?: string
+  url?: string
+  size?: number
+  width?: number
+  height?: number
+  mime?: string
+  createdAt?: string
+  tags?: string[]
+}
+
+const toPhotoReference = (file: ImageKitFile, fallbackMime: string): PhotoReference => ({
+  fileId: String(file.fileId),
+  url: String(file.url),
+  filePath: String(file.filePath),
+  name: String(file.name),
+  size: Number(file.size || 0),
+  width: typeof file.width === 'number' ? file.width : null,
+  height: typeof file.height === 'number' ? file.height : null,
+  mimeType: file.mime || fallbackMime,
+  uploadedAt: file.createdAt || new Date().toISOString()
+})
+
+async function findIdempotentImageKitFile(safeName: string, recordOwnerId: string, computerId: string, env: Env) {
+  const searchQuery = `name: \"${safeName}\"`
+  const response = await fetch(`https://api.imagekit.io/v1/files?limit=10&skip=0&searchQuery=${encodeURIComponent(searchQuery)}`, {
+    headers: { Authorization: imageKitAuthHeader(env.IMAGEKIT_PRIVATE_KEY) }
+  })
+  if (!response.ok) throw new Response('imagekit-file-check-failed', { status: 502 })
+  const files = await response.json() as ImageKitFile[]
+  return files.find((file) => file.name === safeName && ownsImageKitFile(file, recordOwnerId, computerId))
+}
+
+async function imageKitUpload(request: Request, uid: string, recordOwnerId: string, computerId: string, env: Env): Promise<PhotoReference> {
   const mimeType = (request.headers.get('content-type') || '').split(';')[0]
   if (!ALLOWED_IMAGE_TYPES.has(mimeType)) throw new Response('unsupported-image-format', { status: 415 })
+  const uploadKey = request.headers.get('x-upload-key') || ''
+  if (!uploadKey || uploadKey.length > 200) throw new Response('invalid-upload-key', { status: 400 })
   const declaredSize = Number(request.headers.get('content-length') || 0)
   if (declaredSize > MAX_IMAGE_BYTES) throw new Response('image-too-large', { status: 413 })
   const bytes = await request.arrayBuffer()
   if (!bytes.byteLength || bytes.byteLength > MAX_IMAGE_BYTES) throw new Response('invalid-image-size', { status: 413 })
   const extension = mimeType === 'image/png' ? 'png' : mimeType === 'image/webp' ? 'webp' : 'jpg'
-  const safeName = `${computerId}-${crypto.randomUUID()}.${extension}`
+  const contentFingerprint = hex(await crypto.subtle.digest('SHA-256', bytes))
+  const safeName = await buildIdempotentUploadName(uid, computerId, uploadKey, contentFingerprint, extension)
+  const existing = await findIdempotentImageKitFile(safeName, recordOwnerId, computerId, env)
+  if (existing) return toPhotoReference(existing, mimeType)
   const form = new FormData()
   form.set('file', new File([bytes], safeName, { type: mimeType }))
   form.set('fileName', safeName)
-  form.set('folder', `/inventario/${uid}`)
+  form.set('folder', `/inventario/${recordOwnerId}`)
   form.set('isPrivateFile', 'true')
-  form.set('useUniqueFileName', 'true')
+  form.set('useUniqueFileName', 'false')
   form.set('overwriteFile', 'false')
-  form.set('tags', `inventario-computadoras,owner-${uid},computer-${computerId}`)
+  form.set('tags', `inventario-computadoras,owner-${recordOwnerId},uploader-${uid},computer-${computerId}`)
   const response = await fetch('https://upload.imagekit.io/api/v1/files/upload', {
     method: 'POST',
     headers: { Authorization: imageKitAuthHeader(env.IMAGEKIT_PRIVATE_KEY) },
     body: form
   })
   const result = await response.json() as Record<string, unknown>
-  if (!response.ok || !result.fileId || !result.url || !result.filePath) throw new Response('imagekit-upload-failed', { status: 502 })
-  return {
+  if (!response.ok || !result.fileId || !result.url || !result.filePath) {
+    const completedAfterAmbiguousResponse = await findIdempotentImageKitFile(safeName, recordOwnerId, computerId, env)
+    if (completedAfterAmbiguousResponse) return toPhotoReference(completedAfterAmbiguousResponse, mimeType)
+    throw new Response('imagekit-upload-failed', { status: 502 })
+  }
+  return toPhotoReference({
     fileId: String(result.fileId),
     url: String(result.url),
     filePath: String(result.filePath),
-    name: String(result.name || safeName),
-    size: Number(result.size || bytes.byteLength),
-    width: typeof result.width === 'number' ? result.width : null,
-    height: typeof result.height === 'number' ? result.height : null,
-    mimeType,
-    uploadedAt: new Date().toISOString()
-  }
+    name: typeof result.name === 'string' ? result.name : safeName,
+    size: typeof result.size === 'number' ? result.size : bytes.byteLength,
+    width: typeof result.width === 'number' ? result.width : undefined,
+    height: typeof result.height === 'number' ? result.height : undefined,
+    mime: mimeType,
+    createdAt: new Date().toISOString()
+  }, mimeType)
 }
 
 const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map((value) => value.toString(16).padStart(2, '0')).join('')
@@ -157,8 +207,6 @@ async function deleteImageKitFile(fileId: string, env: Env) {
   })
   if (!response.ok && response.status !== 404) throw new Response('imagekit-delete-failed', { status: 502 })
 }
-
-type ImageKitFile = { fileId?: string; filePath?: string; tags?: string[] }
 
 async function loadImageKitFile(fileId: string, env: Env): Promise<ImageKitFile | undefined> {
   const response = await fetch(`https://api.imagekit.io/v1/files/${encodeURIComponent(fileId)}/details`, {
@@ -216,8 +264,9 @@ export default {
       if (action === 'upload') {
         const computer = await loadComputer(computerId, token, env)
         const ownerId = stringField(computer.fields, 'ownerId')
-        if (ownerId !== uid) return json(origin, { error: 'Solo el creador puede subir fotografías' }, 403)
-        return json(origin, await imageKitUpload(request, uid, computerId, env))
+        if (!ownerId) return json(origin, { error: 'El registro no tiene propietario válido' }, 409)
+        // loadComputer usa el token del solicitante y las reglas de Firestore determinan si puede acceder al registro.
+        return json(origin, await imageKitUpload(request, uid, ownerId, computerId, env))
       }
       if (action === 'sign') {
         const computer = await loadComputer(computerId, token, env)

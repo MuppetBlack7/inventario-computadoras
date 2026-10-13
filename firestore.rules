@@ -6,6 +6,11 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    // En el modelo actual, cualquier cuenta autenticada puede acceder al inventario compartido.
+    function canAccessInventory() {
+      return signedIn();
+    }
+
     function owns(data) {
       return signedIn() && data.ownerId is string && data.ownerId == request.auth.uid;
     }
@@ -68,8 +73,28 @@ service cloud.firestore {
       );
     }
 
+    function authenticatedPhotoUpdate(data, previous) {
+      return canAccessInventory()
+        && data.ownerId == previous.ownerId
+        && data.diff(previous).affectedKeys().hasOnly([
+          'photoRemote',
+          'photoLocalRevision',
+          'photoStoredLocally',
+          'updatedAt'
+        ])
+        && 'photoRemote' in data
+        && data.photoLocalRevision is string
+        && data.photoStoredLocally == false
+        && (
+          !('photoRemote' in previous)
+          || data.photoRemote.fileId != previous.photoRemote.fileId
+          || !('photoLocalRevision' in previous)
+          || data.photoLocalRevision != previous.photoLocalRevision
+        );
+    }
+
     match /inventorySessions/{sessionId} {
-      allow read: if signedIn();
+      allow read: if canAccessInventory();
       allow create: if owns(request.resource.data) && validSession(request.resource.data, sessionId);
       allow update: if owns(resource.data)
         && request.resource.data.ownerId == resource.data.ownerId
@@ -78,11 +103,13 @@ service cloud.firestore {
     }
 
     match /inventoryComputers/{computerId} {
-      allow read: if signedIn();
+      allow read: if canAccessInventory();
       allow create: if owns(request.resource.data) && validComputer(request.resource.data, computerId);
-      allow update: if owns(resource.data)
-        && request.resource.data.ownerId == resource.data.ownerId
-        && validComputer(request.resource.data, computerId);
+      allow update: if validComputer(request.resource.data, computerId)
+        && (
+          (owns(resource.data) && request.resource.data.ownerId == resource.data.ownerId)
+          || authenticatedPhotoUpdate(request.resource.data, resource.data)
+        );
       allow delete: if owns(resource.data);
     }
 

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { assertFails, assertSucceeds, initializeTestEnvironment, type RulesTestEnvironment } from '@firebase/rules-unit-testing'
 import { collection, deleteDoc, doc, getDoc, getDocs, setDoc, updateDoc } from 'firebase/firestore'
-import { afterAll, beforeAll, beforeEach, describe, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 let environment: RulesTestEnvironment
 
@@ -77,6 +77,25 @@ describe('inventario compartido autenticado', () => {
     await assertSucceeds(deleteDoc(doc(alice, 'inventoryComputers/alice-pc')))
   })
 
+  it('permite a otra cuenta autenticada reemplazar solo la fotografía', async () => {
+    const alice = environment.authenticatedContext('alice').firestore()
+    const bob = environment.authenticatedContext('bob').firestore()
+    const reference = doc(alice, 'inventoryComputers/shared-photo-pc')
+    await assertSucceeds(setDoc(reference, validComputer('alice', 'shared-photo-pc')))
+    const photoRemote = {
+      fileId: 'bob-photo', url: 'https://ik.imagekit.io/demo/bob-photo.jpg', filePath: '/inventario/alice/bob-photo.jpg', name: 'bob-photo.jpg',
+      size: 4321, width: 800, height: 600, mimeType: 'image/jpeg', uploadedAt: '2026-10-13T12:00:00.000Z'
+    }
+    await assertSucceeds(updateDoc(doc(bob, 'inventoryComputers/shared-photo-pc'), {
+      photoRemote, photoLocalRevision: 'revision-bob', photoStoredLocally: false, updatedAt: '2026-10-13T12:00:00.000Z'
+    }))
+    await assertFails(updateDoc(doc(bob, 'inventoryComputers/shared-photo-pc'), { photoRemote, model: 'Cambio no autorizado' }))
+    const stored = (await getDoc(reference)).data()!
+    expect(stored.ownerId).toBe('alice')
+    expect(stored.model).toBe('Modelo')
+    expect(stored.photoRemote.fileId).toBe('bob-photo')
+  })
+
   it('una restauración no puede escribir a nombre de otra cuenta ni reasignar la propiedad', async () => {
     const alice = environment.authenticatedContext('alice').firestore()
     const bob = environment.authenticatedContext('bob').firestore()
@@ -105,10 +124,15 @@ describe('inventario compartido autenticado', () => {
   it('bloquea por completo a usuarios sin sesión', async () => {
     await environment.withSecurityRulesDisabled(async (context) => {
       await setDoc(doc(context.firestore(), 'inventorySessions/session-1'), validSession('alice', 'session-1'))
+      await setDoc(doc(context.firestore(), 'inventoryComputers/computer-1'), validComputer('alice', 'computer-1'))
     })
     const guest = environment.unauthenticatedContext().firestore()
     await assertFails(getDoc(doc(guest, 'inventorySessions/session-1')))
     await assertFails(getDocs(collection(guest, 'inventorySessions')))
     await assertFails(setDoc(doc(guest, 'inventorySessions/guest-session'), validSession('guest', 'guest-session')))
+    await assertFails(updateDoc(doc(guest, 'inventoryComputers/computer-1'), {
+      photoRemote: { fileId: 'x', url: 'https://example.com/x.jpg', filePath: '/x.jpg', name: 'x.jpg', size: 1, width: null, height: null, mimeType: 'image/jpeg', uploadedAt: '2026-10-13T00:00:00.000Z' },
+      photoLocalRevision: 'x', photoStoredLocally: false, updatedAt: '2026-10-13T00:00:00.000Z'
+    }))
   })
 })

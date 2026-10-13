@@ -173,7 +173,7 @@ describe('acciones con nombres inequívocos y flujo de subida con confirmación'
     expect(reasons('dup')).toContain('posible duplicado')
     expect(reasons('mismatch')).toContain('propietario distinto')
     expect(reasons('theirs')).toContain('otra cuenta')
-    expect(reasons('stuck')).toContain('solo su propietario puede subirla')
+    expect(reasons('stuck')).toContain('puede reemplazarse seleccionando una nueva')
     expect(upload.excludeIds.has('stuck')).toBe(false) // la advertencia de la foto ajena no oculta ni bloquea nada propio
   })
 

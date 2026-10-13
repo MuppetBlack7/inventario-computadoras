@@ -84,6 +84,8 @@ export interface ComputerRecord {
   photoNeedsUpload?: boolean
   photoUploadStatus?: PhotoUploadStatus
   photoUploadError?: string
+  /** Cuenta que seleccionó la foto local pendiente; solo se conserva en este dispositivo. */
+  photoPendingActorId?: string
   /** Cambia cada vez que el usuario selecciona una fotografía local distinta. */
   photoLocalRevision?: string
   importedFrom?: ImportedFrom
@@ -93,7 +95,7 @@ export interface ComputerRecord {
   updatedAt: string
 }
 
-export type SyncOperation = 'upsert-session' | 'delete-session' | 'upsert-computer' | 'delete-computer' | 'cleanup-photo'
+export type SyncOperation = 'upsert-session' | 'delete-session' | 'upsert-computer' | 'update-computer-photo' | 'delete-computer' | 'cleanup-photo'
 export type PhotoCleanupReason = 'replaced-photo' | 'deleted-computer' | 'orphan-upload'
 
 export interface SyncQueueItem {
@@ -103,6 +105,8 @@ export interface SyncQueueItem {
   remoteId?: string
   sessionId?: string
   ownerId?: string
+  /** Propietario inmutable del registro cuando otra cuenta actualiza únicamente su fotografía. */
+  recordOwnerId?: string
   photoFileId?: string
   photoCandidate?: ImageKitPhotoReference
   photoSourceRevision?: string

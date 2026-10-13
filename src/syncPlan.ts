@@ -61,8 +61,8 @@ export function summarizeSync(local: RecoverySnapshot, remote: RemoteRecoverySna
     remoteOnly: report.rows.filter((row) => !row.localId && row.categories.includes('remote-only')).map(ref),
     different: report.rows.filter((row) => row.differences.length > 0).map((row) => ({ ...ref(row), fields: row.differences, hasPendingOperation: row.pending.length > 0, mine: ownerOf(row) === account })),
     photos: {
-      ownPending: local.computers.filter((computer) => computer.ownerId === account && computer.photo && (computer.photoNeedsUpload || !computer.photoRemote)).map((computer) => ({ kind: 'computer' as const, id: computer.id, ownerId: computer.ownerId })),
-      otherAccount: report.rows.filter((row) => row.categories.includes('photo-pending') && ownerOf(row) && ownerOf(row) !== account).map((row) => ({ ...ref(row), ownerName: ownerName(row) })),
+      ownPending: local.computers.filter((computer) => (computer.photoPendingActorId || computer.ownerId) === account && computer.photo && (computer.photoNeedsUpload || !computer.photoRemote)).map((computer) => ({ kind: 'computer' as const, id: computer.id, ownerId: computer.ownerId })),
+      otherAccount: report.rows.filter((row) => row.categories.includes('photo-pending') && ownerOf(row) && ownerOf(row) !== account && !local.computers.some((computer) => computer.id === row.localId && computer.photoPendingActorId === account)).map((row) => ({ ...ref(row), ownerName: ownerName(row) })),
       localBytesProtected: remote ? local.computers.filter((computer) => computer.photo && remote.computers.some((entry) => (entry.id === computer.id || entry.id === computer.cloudId) && !entry.photoRemote) && !computer.photoNeedsUpload).length : 0
     },
     otherAccountRecords: report.rows.filter((row) => row.categories.includes('other-account-record')).length,
@@ -102,7 +102,7 @@ export function summarizePending(local: RecoverySnapshot, remote: RemoteRecovery
       if (row.localId && row.categories.includes('local-only') && owner === account && !items.has(row.localId)) items.set(row.localId, { kind: row.kind, id: row.localId, ownerId: owner, operation: 'solo-local' })
     }
   }
-  const photos = local.computers.filter((computer) => computer.ownerId === account && computer.photo && (computer.photoNeedsUpload || !computer.photoRemote)).length
+  const photos = local.computers.filter((computer) => (computer.photoPendingActorId || computer.ownerId) === account && computer.photo && (computer.photoNeedsUpload || !computer.photoRemote)).length
   return { records: items.size, photos, reliable: remote !== null, items: [...items.values()] }
 }
 
@@ -218,7 +218,7 @@ export function buildProposal(local: RecoverySnapshot, remote: RemoteRecoverySna
   // «Conservar localmente por ahora»: las operaciones pendientes existentes no se ejecutan (salvo las elegidas explícitamente).
   if (!decisions.uploadMyChanges) {
     for (const item of local.queue) {
-      if (item.ownerId === account && !explicitUploads.has(item.entityId)) {
+      if (item.ownerId === account && item.operation !== 'update-computer-photo' && !explicitUploads.has(item.entityId)) {
         excludeIds.add(item.entityId)
         if (item.remoteId) excludeIds.add(item.remoteId)
       }

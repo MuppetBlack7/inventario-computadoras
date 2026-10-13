@@ -1,4 +1,4 @@
-import { collection, deleteDoc, doc, getCountFromServer, getDoc, getDocs, limit, onSnapshot, orderBy, query, setDoc, startAfter, where, type DocumentChange, type DocumentData, type QueryConstraint, type QueryDocumentSnapshot, type Unsubscribe } from 'firebase/firestore'
+import { collection, deleteDoc, doc, getCountFromServer, getDoc, getDocs, limit, onSnapshot, orderBy, query, setDoc, startAfter, updateDoc, where, type DocumentChange, type DocumentData, type QueryConstraint, type QueryDocumentSnapshot, type Unsubscribe } from 'firebase/firestore'
 import {
   applyRemoteComputer,
   applyRemoteSession,
@@ -99,6 +99,7 @@ const computerPayload = (computer: ComputerRecord, ownerId: string, cloudId: str
   photoNeedsUpload: undefined,
   photoUploadStatus: undefined,
   photoUploadError: undefined,
+  photoPendingActorId: undefined,
   syncStatus: undefined,
   syncError: undefined
 })
@@ -157,6 +158,50 @@ async function syncItem(ownerId: string, item: SyncQueueItem, scope: SyncScope =
     return completeSessionSync(item, cloudId)
   }
 
+  if (item.operation === 'update-computer-photo') {
+    const computer = await getComputer(item.entityId)
+    if (!computer) return completeDeleteSync(item)
+    if (computer.photoPendingActorId !== ownerId) throw Object.assign(new Error('La fotografía pendiente pertenece a otra cuenta'), { code: 'permission-denied' })
+    if (!computer.photo || !computer.photoNeedsUpload) throw Object.assign(new Error('La fotografía seleccionada no está disponible localmente'), { code: 'failed-precondition' })
+    const cloudId = computer.cloudId || item.remoteId || computer.id
+    const reference = doc(firestore, SHARED_COMPUTERS, cloudId)
+    const remoteBefore = await getDoc(reference)
+    if (!remoteBefore.exists()) throw Object.assign(new Error('El equipo ya no existe en Firebase'), { code: 'failed-precondition' })
+    const recordOwnerId = remoteBefore.data().ownerId as string | undefined
+    if (!recordOwnerId || (item.recordOwnerId && item.recordOwnerId !== recordOwnerId)) {
+      throw Object.assign(new Error('El propietario remoto no coincide con el registro local'), { code: 'permission-denied' })
+    }
+    if (!imageKitConfigured) throw Object.assign(new Error('Backend de ImageKit pendiente de configurar'), { code: 'unavailable' })
+    await updateComputerPhotoState(computer.id, { photoUploadStatus: 'uploading', photoUploadError: undefined })
+    let uploadedCandidate = item.photoCandidate && item.photoSourceRevision === computer.photoLocalRevision
+      ? item.photoCandidate
+      : undefined
+    if (!uploadedCandidate) {
+      uploadedCandidate = await uploadPhotoToImageKit(cloudId, computer.photo, computer.photoName, computer.photoLocalRevision || item.revision || item.id)
+      if (!await savePhotoCandidate(item, uploadedCandidate, computer.photoLocalRevision)) return false
+    }
+    if (!await isSyncQueueItemCurrent(item)) return false
+    await updateDoc(reference, clean({
+      photoRemote: uploadedCandidate,
+      photoLocalRevision: computer.photoLocalRevision || item.revision || item.id,
+      photoStoredLocally: false,
+      updatedAt: computer.updatedAt
+    }))
+    const verified = await getDoc(reference)
+    if (!verified.exists() || verified.data().ownerId !== recordOwnerId || verified.data().photoRemote?.fileId !== uploadedCandidate.fileId) {
+      throw new Error('Firebase no confirmó la nueva fotografía')
+    }
+    if (!await isSyncQueueItemCurrent(item)) return false
+    return completeComputerSync(item, cloudId, {
+      photoRemote: uploadedCandidate,
+      photoNeedsUpload: false,
+      photoUploadStatus: 'uploaded',
+      photoUploadError: undefined,
+      photoStoredLocally: false,
+      photoPendingActorId: undefined
+    })
+  }
+
   if (item.operation === 'upsert-computer') {
     const computer = await getComputer(item.entityId)
     if (!computer) return completeDeleteSync(item)
@@ -185,10 +230,10 @@ async function syncItem(ownerId: string, item: SyncQueueItem, scope: SyncScope =
       } else if (imageKitConfigured) {
         await updateComputerPhotoState(computer.id, { photoUploadStatus: 'uploading', photoUploadError: undefined })
         if (!uploadedCandidate) {
-          uploadedCandidate = await uploadPhotoToImageKit(cloudId, computer.photo, computer.photoName)
+          uploadedCandidate = await uploadPhotoToImageKit(cloudId, computer.photo, computer.photoName, computer.photoLocalRevision || item.revision || item.id)
           if (!await savePhotoCandidate(item, uploadedCandidate, computer.photoLocalRevision)) return false
         }
-        syncedComputer = { ...computer, photoRemote: uploadedCandidate, photoNeedsUpload: false, photoUploadStatus: 'uploaded', photoUploadError: undefined, photoStoredLocally: false }
+        syncedComputer = { ...computer, photoRemote: uploadedCandidate, photoNeedsUpload: false, photoUploadStatus: 'uploaded', photoUploadError: undefined, photoStoredLocally: false, photoPendingActorId: undefined }
       } else {
         syncedComputer = { ...computer, photoNeedsUpload: true, photoUploadStatus: 'pending' }
         await updateComputerPhotoState(computer.id, { photoNeedsUpload: true, photoUploadStatus: 'pending', photoUploadError: 'Backend de ImageKit pendiente de configurar' })
@@ -216,6 +261,7 @@ async function syncItem(ownerId: string, item: SyncQueueItem, scope: SyncScope =
       photoUploadStatus: syncedComputer.photoUploadStatus,
       photoUploadError: syncedComputer.photoUploadError,
       photoStoredLocally: syncedComputer.photoStoredLocally,
+      photoPendingActorId: syncedComputer.photoPendingActorId,
       photoPath: syncedComputer.photoPath
     }, cleanupFileIds)
   }
@@ -274,8 +320,9 @@ const RETRY_MAX_MS = 60_000
 const operationPriority = (item: SyncQueueItem) => {
   if (item.operation === 'upsert-session') return 0
   if (item.operation === 'upsert-computer') return 1
-  if (item.operation === 'delete-computer') return 2
-  if (item.operation === 'cleanup-photo') return 3
+  if (item.operation === 'update-computer-photo') return 2
+  if (item.operation === 'delete-computer') return 3
+  if (item.operation === 'cleanup-photo') return 4
   return 4
 }
 
@@ -317,13 +364,13 @@ async function runSynchronize(ownerId: string, report: SyncReporter, options: Sy
   }
   const inScope = (item: SyncQueueItem) => {
     if (options.exclude?.has(item.entityId) || (item.remoteId && options.exclude?.has(item.remoteId))) return false
-    if (scope === 'operations') return item.operation !== 'cleanup-photo'
-    if (scope === 'photos') return item.operation === 'upsert-computer' && pendingPhotoEntities.has(item.entityId)
+    if (scope === 'operations') return item.operation !== 'cleanup-photo' && item.operation !== 'update-computer-photo'
+    if (scope === 'photos') return item.operation === 'update-computer-photo' || item.operation === 'upsert-computer' && pendingPhotoEntities.has(item.entityId)
     return true
   }
   const initialQueue = (await getPendingSyncQueue()).filter((item) => item.ownerId === ownerId)
   if (!initialQueue.length) {
-    const photosLocalOnly = (await listComputers()).filter((computer) => computer.ownerId === ownerId && computer.photo && !computer.photoRemote).length
+    const photosLocalOnly = (await listComputers()).filter((computer) => (computer.photoPendingActorId || computer.ownerId) === ownerId && computer.photo && !computer.photoRemote).length
     report('synced', photosLocalOnly ? `Sincronizado · ${photosLocalOnly} foto${photosLocalOnly === 1 ? '' : 's'} pendiente${photosLocalOnly === 1 ? '' : 's'}` : 'Sincronizado')
     return { synced: 0, errors: 0, photosLocalOnly, pending: 0 }
   }
@@ -353,7 +400,7 @@ async function runSynchronize(ownerId: string, report: SyncReporter, options: Sy
         await markSyncQueueFailure(item, message, new Date(Date.now() + delay).toISOString(), transient)
         if (item.operation.includes('computer')) {
           await updateComputerSyncState(item.entityId, 'error', message)
-          if (item.operation === 'upsert-computer') await updateComputerPhotoState(item.entityId, { photoUploadStatus: 'error', photoUploadError: message })
+          if (item.operation === 'upsert-computer' || item.operation === 'update-computer-photo') await updateComputerPhotoState(item.entityId, { photoUploadStatus: 'error', photoUploadError: message })
         }
         if (item.operation.includes('session')) await updateSessionSyncState(item.entityId, 'error', message)
         if (transient && item.operation !== 'cleanup-photo') {
@@ -368,7 +415,7 @@ async function runSynchronize(ownerId: string, report: SyncReporter, options: Sy
     getPendingSyncQueue().then((items) => items.filter((item) => item.ownerId === ownerId)),
     listComputers()
   ])
-  const photosLocalOnly = localComputers.filter((computer) => computer.ownerId === ownerId && computer.photo && !computer.photoRemote).length
+  const photosLocalOnly = localComputers.filter((computer) => (computer.photoPendingActorId || computer.ownerId) === ownerId && computer.photo && !computer.photoRemote).length
   const cleanupPending = remaining.filter((item) => item.operation === 'cleanup-photo').length
   const retryAt = remaining.filter((item) => item.retryable !== false).map((item) => item.nextAttemptAt).filter(Boolean).sort()[0]
   const retryAfterMs = retryAt ? Math.max(0, Date.parse(retryAt) - Date.now()) : undefined

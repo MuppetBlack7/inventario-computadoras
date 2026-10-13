@@ -11,6 +11,7 @@ const store = vi.hoisted(() => ({
 }))
 const photoStore = vi.hoisted(() => ({
   failUpload: false,
+  uploadedByKey: new Map<string, Row>(),
   uploads: 0,
   failDeletes: 0,
   deletes: [] as string[],
@@ -65,6 +66,13 @@ vi.mock('firebase/firestore', () => {
       if (store.setHook) await store.setHook(ref, row)
       store.activeSets -= 1
     },
+    updateDoc: async (ref: { name: string; id: string }, changes: Row) => {
+      store.setCalls += 1
+      if (store.failSetAt === store.setCalls) throw Object.assign(new Error('Red interrumpida'), { code: 'unavailable' })
+      const previous = store.data.get(ref.name)?.get(ref.id)
+      if (!previous) throw Object.assign(new Error('Documento inexistente'), { code: 'not-found' })
+      store.data.get(ref.name)!.set(ref.id, { ...previous, ...changes })
+    },
     deleteDoc: async (ref: { name: string; id: string }) => { store.deleteLog.push(`${ref.name}/${ref.id}`); store.data.get(ref.name)?.delete(ref.id) },
     onSnapshot: (ref: { name: string }, next: (snapshot: { docChanges: () => unknown[] }) => void, error: (error: Error) => void) => {
       const listeners = store.listeners.get(ref.name) ?? new Set()
@@ -78,12 +86,16 @@ vi.mock('firebase/firestore', () => {
 
 vi.mock('./imageKitClient', () => ({
   imageKitConfigured: true,
-  uploadPhotoToImageKit: vi.fn(async (_computerId: string, photo: Blob) => {
+  uploadPhotoToImageKit: vi.fn(async (computerId: string, photo: Blob, _fileName?: string, uploadKey = computerId) => {
     if (photoStore.failUpload) throw Object.assign(new Error('ImageKit no disponible'), { code: 'unavailable' })
+    const previous = photoStore.uploadedByKey.get(uploadKey)
+    if (previous) return previous
     photoStore.uploads += 1
     if (photoStore.uploadHook) await photoStore.uploadHook()
     const fileId = `photo-${photoStore.uploads}`
-    return { fileId, url: `https://example.com/${fileId}.jpg`, filePath: `/inventario/alice/${fileId}.jpg`, name: `${fileId}.jpg`, size: photo.size, width: null, height: null, mimeType: photo.type, uploadedAt: minute(0) }
+    const reference = { fileId, url: `https://example.com/${fileId}.jpg`, filePath: `/inventario/alice/${fileId}.jpg`, name: `${fileId}.jpg`, size: photo.size, width: null, height: null, mimeType: photo.type, uploadedAt: minute(0) }
+    photoStore.uploadedByKey.set(uploadKey, reference)
+    return reference
   }),
   cleanupImageKitPhoto: vi.fn(async (_computerId: string, fileId: string) => {
     if (photoStore.failDeletes > 0) {
@@ -98,7 +110,7 @@ vi.mock('./imageKitClient', () => ({
   })
 }))
 
-import { getComputer, getDatabase, clearAllData, deleteComputer, deleteSessionAndComputers, getPendingSyncQueue, listComputers, listSessions, listVisibleComputers, queuePhotoCleanup, saveComputer, saveSession } from './db'
+import { getComputer, getDatabase, clearAllData, deleteComputer, deleteSessionAndComputers, getPendingSyncQueue, listComputers, listSessions, listVisibleComputers, queuePhotoCleanup, saveComputer, saveSession, saveSharedComputerPhoto } from './db'
 import { describeSyncError, pullCloudData, subscribeToSharedInventory, synchronize, synchronizeAndPull } from './cloudSync'
 import { normalizeKey } from './utils'
 import type { ComputerRecord, InventorySession } from './types'
@@ -130,6 +142,7 @@ const seed = () => {
   store.setHook = undefined
   store.getDocsHook = undefined
   photoStore.failUpload = false
+  photoStore.uploadedByKey = new Map()
   photoStore.uploads = 0
   photoStore.failDeletes = 0
   photoStore.deletes = []
@@ -166,6 +179,54 @@ beforeEach(async () => {
   seed()
 })
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
+
+describe('actualización compartida de fotografías', () => {
+  it('permite que Bob reemplace la foto del equipo de Alice sin cambiar propietario ni otros datos', async () => {
+    await pullCloudData('bob', { force: true })
+    const aliceComputer = (await listComputers()).find((item) => item.cloudId === 'c0')!
+    const saved = await saveSharedComputerPhoto({ ...aliceComputer, photo: new Blob(['foto-bob'], { type: 'image/jpeg' }), photoName: 'foto-bob.jpg' }, 'bob')
+    expect(saved.ownerId).toBe('alice')
+    expect((await getPendingSyncQueue()).find((item) => item.entityId === saved.id)).toMatchObject({ operation: 'update-computer-photo', ownerId: 'bob', recordOwnerId: 'alice' })
+    const result = await synchronize('bob')
+    const remote = store.data.get('inventoryComputers')!.get('c0')!
+    expect(result).toMatchObject({ synced: 1, errors: 0, pending: 0 })
+    expect(remote.ownerId).toBe('alice')
+    expect(remote.model).toBe('Modelo')
+    expect(remote.photoRemote.fileId).toBe('photo-1')
+    expect((await listComputers()).find((item) => item.cloudId === 'c0')?.ownerId).toBe('alice')
+  })
+
+  it('conserva pendiente una subida fallida y la reintenta sin duplicar el archivo', async () => {
+    await pullCloudData('bob', { force: true })
+    const aliceComputer = (await listComputers()).find((item) => item.cloudId === 'c2')!
+    await saveSharedComputerPhoto({ ...aliceComputer, photo: new Blob(['foto-pendiente'], { type: 'image/webp' }), photoName: 'foto.webp' }, 'bob')
+    photoStore.failUpload = true
+    const failed = await synchronize('bob')
+    expect(failed).toMatchObject({ synced: 0, errors: 1, pending: 1 })
+    expect(store.data.get('inventoryComputers')!.get('c2')!.photoRemote).toBeUndefined()
+    expect((await listComputers()).find((item) => item.cloudId === 'c2')?.photoUploadStatus).not.toBe('uploaded')
+    photoStore.failUpload = false
+    const recovered = await synchronize('bob', undefined, { force: true })
+    expect(recovered.pending).toBe(0)
+    expect(photoStore.uploads).toBe(1)
+  })
+
+  it('reutiliza la subida confirmada si Firestore falla antes de guardar la referencia', async () => {
+    await pullCloudData('bob', { force: true })
+    const aliceComputer = (await listComputers()).find((item) => item.cloudId === 'c4')!
+    await saveSharedComputerPhoto({ ...aliceComputer, photo: new Blob(['foto-confirmada'], { type: 'image/png' }), photoName: 'foto.png' }, 'bob')
+    store.failSetAt = 1
+    const failed = await synchronize('bob')
+    expect(failed).toMatchObject({ errors: 1, pending: 1 })
+    expect(photoStore.uploads).toBe(1)
+    expect(store.data.get('inventoryComputers')!.get('c4')!.photoRemote).toBeUndefined()
+    store.failSetAt = 0
+    const recovered = await synchronize('bob', undefined, { force: true })
+    expect(recovered.pending).toBe(0)
+    expect(photoStore.uploads).toBe(1)
+    expect(store.data.get('inventoryComputers')!.get('c4')!.photoRemote.fileId).toBe('photo-1')
+  })
+})
 
 describe('descarga incremental de Firestore', () => {
   it('la primera descarga pagina 250 equipos de 4 sesiones y dos usuarios', async () => {

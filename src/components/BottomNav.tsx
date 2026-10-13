@@ -16,7 +16,7 @@ export const viewForNav = (key: NavKey, currentSessionId?: string): NavTarget =>
 
 /** Opción resaltada según la pantalla actual (las pantallas de inventario, formulario y detalle pertenecen a «Sesiones»). */
 export const activeNavKey = (viewName: string): NavKey | null =>
-  ['sessions', 'inventory', 'form', 'detail'].includes(viewName) ? 'sessions' : viewName === 'scanner' ? 'scanner' : viewName === 'sync' ? 'sync' : null
+  ['sessions', 'inventory', 'form', 'photo', 'detail'].includes(viewName) ? 'sessions' : viewName === 'scanner' ? 'scanner' : viewName === 'sync' ? 'sync' : null
 
 interface Props {
   viewName: string

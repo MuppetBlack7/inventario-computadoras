@@ -36,7 +36,10 @@ export interface PermissionContext { imageKitConfigured: boolean }
 
 const ownerOf = (row: RecoveryRow) => row.ownerId ?? row.remoteOwnerId
 const involvesAccount = (row: RecoveryRow, accountId: string) => row.ownerId === accountId || row.remoteOwnerId === accountId || (!row.ownerId && !row.remoteOwnerId)
-const isForeignPhotoPending = (row: RecoveryRow, accountId: string) => row.categories.includes('photo-pending') && Boolean(ownerOf(row)) && ownerOf(row) !== accountId
+const isForeignPhotoPending = (row: RecoveryRow, accountId: string, local: RecoverySnapshot) => {
+  const computer = row.localId ? local.computers.find((entry) => entry.id === row.localId) : undefined
+  return row.categories.includes('photo-pending') && Boolean(ownerOf(row)) && ownerOf(row) !== accountId && computer?.photoPendingActorId !== accountId
+}
 
 const byIdOrCloud = <T extends { id: string; cloudId?: string }>(items: T[], id: string | undefined) => (id ? items.find((item) => item.id === id || item.cloudId === id) : undefined)
 
@@ -56,7 +59,7 @@ export function evaluateScopes(local: RecoverySnapshot, remote: RemoteRecoverySn
   const account = report.accountId
   const reasons = describeReviewReasons(local, remote, report)
   const warnings: string[] = []
-  const foreignPhotos = report.rows.filter((row) => isForeignPhotoPending(row, account)).length
+  const foreignPhotos = report.rows.filter((row) => isForeignPhotoPending(row, account, local)).length
   if (foreignPhotos) warnings.push(`${foreignPhotos} fotografía${foreignPhotos === 1 ? '' : 's'} pendiente${foreignPhotos === 1 ? '' : 's'} de otra cuenta: ${foreignPhotos === 1 ? 'permanece' : 'permanecen'} visible${foreignPhotos === 1 ? '' : 's'}, no se modifica${foreignPhotos === 1 ? '' : 'n'} ni se marca${foreignPhotos === 1 ? '' : 'n'} como recuperada${foreignPhotos === 1 ? '' : 's'}`)
   if (report.ownership.foreignPending) warnings.push(`${report.ownership.foreignPending} operación(es) pendiente(s) de otra cuenta: no se ejecutan ni se eliminan`)
 
@@ -92,7 +95,7 @@ export function evaluateScopes(local: RecoverySnapshot, remote: RemoteRecoverySn
 }
 
 const ownPhotoCandidates = (local: RecoverySnapshot, account: string): ComputerRecord[] =>
-  local.computers.filter((computer) => computer.ownerId === account && Boolean(computer.photo) && (Boolean(computer.photoNeedsUpload) || !computer.photoRemote))
+  local.computers.filter((computer) => (computer.photoPendingActorId || computer.ownerId) === account && Boolean(computer.photo) && (Boolean(computer.photoNeedsUpload) || !computer.photoRemote))
 
 /** Equipos propios cuya fotografía se subiría, con el documento completo que acompaña a la subida. */
 function photoUploadItems(local: RecoverySnapshot, report: RecoveryReport, exclude: ReadonlySet<string>) {
@@ -100,9 +103,10 @@ function photoUploadItems(local: RecoverySnapshot, report: RecoveryReport, exclu
   const items: PreviewItem[] = []
   const excluded: PreviewItem[] = []
   for (const computer of ownPhotoCandidates(local, account)) {
-    const queued = local.queue.find((item) => item.entityId === computer.id)
+    const queued = local.queue.find((item) => item.entityId === computer.id && item.operation === 'update-computer-photo')
+      || local.queue.find((item) => item.entityId === computer.id)
     // Una baja pendiente sobre el mismo equipo ocupa su lugar en la cola: no hay subida.
-    if (queued && queued.operation !== 'upsert-computer') {
+    if (queued && queued.operation !== 'upsert-computer' && queued.operation !== 'update-computer-photo') {
       excluded.push({ action: 'upload-photo', kind: 'computer', id: computer.id, detail: `tiene una operación pendiente ${queued.operation}: no se sube la foto` })
       continue
     }
@@ -113,9 +117,9 @@ function photoUploadItems(local: RecoverySnapshot, report: RecoveryReport, exclu
     const row = report.rows.find((entry) => entry.localId === computer.id)
     const changes = row?.differences.length ? `campos distintos que se escribirán: ${row.differences.join(', ')}` : row?.categories.includes('local-only') ? 'documento nuevo en Firestore' : 'sin cambios de datos respecto a Firestore'
     items.push({ action: 'upload-photo', kind: 'computer', id: computer.id, detail: `${computer.photo?.size ?? 0} bytes` })
-    items.push({ action: 'write-document', kind: 'computer', id: computer.id, detail: `${changes}; ${queued ? 'ya tiene una operación pendiente en la cola' : 'se encolará una operación local'}` })
+    items.push({ action: queued?.operation === 'update-computer-photo' ? 'update-photo-reference' : 'write-document', kind: 'computer', id: computer.id, detail: queued?.operation === 'update-computer-photo' ? 'solo cambia la referencia de fotografía; propietario y demás datos permanecen intactos' : `${changes}; ${queued ? 'ya tiene una operación pendiente en la cola' : 'se encolará una operación local'}` })
   }
-  for (const row of report.rows) if (isForeignPhotoPending(row, account)) excluded.push({ action: 'upload-photo', kind: 'computer', id: row.localId || row.remoteId || '?', detail: 'fotografía de otra cuenta: solo su propietario puede subirla' })
+  for (const row of report.rows) if (isForeignPhotoPending(row, account, local)) excluded.push({ action: 'upload-photo', kind: 'computer', id: row.localId || row.remoteId || '?', detail: 'fotografía pendiente en otro dispositivo: puede reemplazarse seleccionando una nueva en este dispositivo' })
   return { items, excluded }
 }
 
@@ -131,6 +135,7 @@ export function previewScope(scope: RecoveryScope, local: RecoverySnapshot, remo
       const targetOwner = target?.ownerId ?? (kind === 'session' ? byIdOrCloud(remote?.sessions ?? [], item.remoteId || item.entityId)?.ownerId : byIdOrCloud(remote?.computers ?? [], item.remoteId || item.entityId)?.ownerId)
       const entry: PreviewItem = { action: item.operation, kind, id: item.entityId, detail: `reintentos: ${item.attempts ?? 0}` }
       if (item.ownerId !== account) excluded.push({ ...entry, detail: 'operación de otra cuenta o sin propietario: no se ejecuta' })
+      else if (item.operation === 'update-computer-photo') excluded.push({ ...entry, detail: 'actualización de fotografía: se procesa únicamente en el paso de fotografías' })
       else if (targetOwner && targetOwner !== account) excluded.push({ ...entry, detail: 'afecta a un registro de otra cuenta: permanece bloqueada' })
       else if (exclude.has(item.entityId) || (item.remoteId && exclude.has(item.remoteId))) excluded.push({ ...entry, detail: 'excluido por conflicto o riesgo' })
       // Las limpiezas de archivos de ImageKit no se ejecutan en este alcance: quedan en la cola.

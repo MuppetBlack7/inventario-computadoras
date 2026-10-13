@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import worker, { buildSignedImageUrl, canCleanupImageKitFile, isAllowedOrigin, isSafePhotoPath, ownsImageKitFile } from '../src/index'
+import worker, { buildIdempotentUploadName, buildSignedImageUrl, canCleanupImageKitFile, isAllowedOrigin, isSafePhotoPath, ownsImageKitFile } from '../src/index'
 
 vi.mock('jose', () => ({
   createRemoteJWKSet: () => ({}),
@@ -18,6 +18,35 @@ describe('ImageKit Worker', () => {
     expect(result.url).toContain('ik-t=1300')
     expect(result.url).toContain('ik-s=')
     expect(result.url).not.toContain('private_test_only')
+  })
+
+  it('usa el mismo archivo al reintentar y otro para una revisión distinta', async () => {
+    const first = await buildIdempotentUploadName('alice', 'equipo-1', 'revision-1', 'contenido-a', 'jpg')
+    expect(await buildIdempotentUploadName('alice', 'equipo-1', 'revision-1', 'contenido-a', 'jpg')).toBe(first)
+    expect(await buildIdempotentUploadName('alice', 'equipo-1', 'revision-2', 'contenido-a', 'jpg')).not.toBe(first)
+    expect(await buildIdempotentUploadName('alice', 'equipo-1', 'revision-1', 'contenido-b', 'jpg')).not.toBe(first)
+  })
+
+  it('permite subir a una cuenta autenticada con acceso aunque no sea la propietaria', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ fields: { ownerId: { stringValue: 'bob' } } }))
+      .mockResolvedValueOnce(Response.json([]))
+      .mockResolvedValueOnce(Response.json({
+        fileId: 'photo-1', url: 'https://ik.imagekit.io/demo/photo-1.jpg', filePath: '/inventario/bob/photo-1.jpg',
+        name: 'photo-1.jpg', size: 4, width: 100, height: 80
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const response = await worker.fetch(new Request('https://worker.example/upload?computerId=equipo-1', {
+        method: 'POST',
+        headers: { Origin: 'http://localhost:5173', Authorization: 'Bearer token-de-prueba', 'Content-Type': 'image/jpeg', 'X-Upload-Key': 'revision-1' },
+        body: new Uint8Array([0xff, 0xd8, 0xff, 0xd9])
+      }), { FIREBASE_PROJECT_ID: 'inventario-computadoras-rc26', IMAGEKIT_URL_ENDPOINT: 'https://ik.imagekit.io/demo', IMAGEKIT_PRIVATE_KEY: 'private_test_only' })
+      expect(response.status).toBe(200)
+      expect(await response.json()).toMatchObject({ fileId: 'photo-1', filePath: '/inventario/bob/photo-1.jpg' })
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('rechaza solicitudes sin sesión antes de comprobar secretos', async () => {
@@ -39,7 +68,7 @@ describe('ImageKit Worker', () => {
   })
 
   it('solo autoriza limpiar archivos etiquetados para el usuario y equipo correctos', () => {
-    const file = { fileId: 'photo-1', filePath: '/inventario/alice/photo-1.jpg', tags: ['inventario-computadoras', 'owner-alice', 'computer-equipo-1'] }
+    const file = { fileId: 'photo-1', filePath: '/inventario/alice/photo-1.jpg', tags: ['inventario-computadoras', 'owner-alice', 'uploader-bob', 'computer-equipo-1'] }
     expect(ownsImageKitFile(file, 'alice', 'equipo-1')).toBe(true)
     expect(canCleanupImageKitFile(file, 'alice', 'equipo-1', false)).toBe(true)
     expect(canCleanupImageKitFile(file, 'bob', 'equipo-1', false)).toBe(false)
