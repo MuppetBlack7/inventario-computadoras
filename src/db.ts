@@ -73,6 +73,8 @@ const sameQueueRevision = (current: SyncQueueItem | undefined, expected: SyncQue
 
 /** Error de guardado local con un mensaje seguro para mostrar al usuario. */
 export class LocalSaveError extends Error {
+  code = 'local-storage-failed'
+
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options)
     this.name = 'LocalSaveError'
@@ -105,6 +107,11 @@ export async function preparePhotoForStorage(photo: Blob): Promise<Blob> {
   const type = photo.type || sniffImageType(new Uint8Array(buffer, 0, Math.min(12, buffer.byteLength)))
   if (!type) throw new LocalSaveError('El archivo seleccionado no es una imagen compatible.')
   return new Blob([buffer], { type })
+}
+
+/** Materializa otra vez la fotografía antes de reescribir un registro leído de IndexedDB. */
+export async function prepareComputerForRewrite(computer: ComputerRecord): Promise<ComputerRecord> {
+  return computer.photo ? { ...computer, photo: await preparePhotoForStorage(computer.photo) } : computer
 }
 
 const describeStorageFailure = (error: unknown) => {
@@ -464,27 +471,50 @@ export async function completeSessionSync(item: SyncQueueItem, cloudId: string) 
 
 export async function completeComputerSync(item: SyncQueueItem, cloudId: string, changes: Partial<ComputerRecord> = {}, cleanupFileIds: string[] = []) {
   const database = await getDatabase()
+  const before = await database.get('computers', item.entityId)
+  const preparedPhoto = before?.photo ? await preparePhotoForStorage(before.photo) : undefined
   const transaction = database.transaction(['computers', 'syncQueue'], 'readwrite')
-  const queue = transaction.objectStore('syncQueue')
-  const current = await queue.get(item.id)
-  if (!sameQueueRevision(current, item)) {
+  transaction.done.catch(() => undefined)
+  try {
+    const queue = transaction.objectStore('syncQueue')
+    const current = await queue.get(item.id)
+    if (!sameQueueRevision(current, item)) {
+      await transaction.done
+      return false
+    }
+    const computer = await transaction.objectStore('computers').get(item.entityId)
+    // Si el registro cambió mientras se materializaba la foto, conserva la cola y deja que la revisión nueva decida.
+    if (Boolean(computer) !== Boolean(before) || (computer && before && (computer.updatedAt !== before.updatedAt || computer.photoLocalRevision !== before.photoLocalRevision))) {
+      await transaction.done
+      return false
+    }
+    if (computer) {
+      await transaction.objectStore('computers').put({
+        ...computer,
+        ...changes,
+        photo: preparedPhoto,
+        syncStatus: 'synced',
+        syncError: undefined,
+        cloudId,
+        sharedCloud: true
+      })
+    }
+    for (const fileId of new Set(cleanupFileIds.filter(Boolean))) {
+      if (changes.photoRemote?.fileId === fileId) continue
+      const cleanupKey = queueKey('cleanup-photo', item.entityId, fileId)
+      const previousCleanup = await queue.get(cleanupKey)
+      await queue.put(queueItem('cleanup-photo', item.entityId, item.ownerId, cloudId, fileId, previousCleanup, {
+        sessionId: computer?.sessionId || item.sessionId,
+        cleanupReason: 'replaced-photo'
+      }))
+    }
+    await queue.delete(item.id)
     await transaction.done
-    return false
+    return true
+  } catch (error) {
+    try { transaction.abort() } catch { /* ya terminó */ }
+    throw describeStorageFailure(error)
   }
-  const computer = await transaction.objectStore('computers').get(item.entityId)
-  if (computer) await transaction.objectStore('computers').put({ ...computer, ...changes, syncStatus: 'synced', syncError: undefined, cloudId, sharedCloud: true })
-  for (const fileId of new Set(cleanupFileIds.filter(Boolean))) {
-    if (changes.photoRemote?.fileId === fileId) continue
-    const cleanupKey = queueKey('cleanup-photo', item.entityId, fileId)
-    const previousCleanup = await queue.get(cleanupKey)
-    await queue.put(queueItem('cleanup-photo', item.entityId, item.ownerId, cloudId, fileId, previousCleanup, {
-      sessionId: computer?.sessionId || item.sessionId,
-      cleanupReason: 'replaced-photo'
-    }))
-  }
-  await queue.delete(item.id)
-  await transaction.done
-  return true
 }
 
 export async function completeDeleteSync(item: SyncQueueItem) {
@@ -583,18 +613,52 @@ export async function updateSessionSyncState(id: string, status: SyncStatus, err
 
 export async function updateComputerSyncState(id: string, status: SyncStatus, error?: string, cloudId?: string, photoPath?: string, sharedCloud?: boolean) {
   const database = await getDatabase()
+  const before = await database.get('computers', id)
+  if (!before) return
+  const preparedPhoto = before.photo ? await preparePhotoForStorage(before.photo) : undefined
   const transaction = database.transaction('computers', 'readwrite')
-  const computer = await transaction.store.get(id)
-  if (computer) await transaction.store.put({ ...computer, syncStatus: status, syncError: error, cloudId: cloudId || computer.cloudId, photoPath: photoPath || computer.photoPath, sharedCloud: sharedCloud ?? computer.sharedCloud })
-  await transaction.done
+  transaction.done.catch(() => undefined)
+  try {
+    const computer = await transaction.store.get(id)
+    if (!computer || computer.updatedAt !== before.updatedAt || computer.photoLocalRevision !== before.photoLocalRevision) {
+      await transaction.done
+      return
+    }
+    await transaction.store.put({
+      ...computer,
+      photo: preparedPhoto,
+      syncStatus: status,
+      syncError: error,
+      cloudId: cloudId || computer.cloudId,
+      photoPath: photoPath || computer.photoPath,
+      sharedCloud: sharedCloud ?? computer.sharedCloud
+    })
+    await transaction.done
+  } catch (storageError) {
+    try { transaction.abort() } catch { /* ya terminó */ }
+    throw describeStorageFailure(storageError)
+  }
 }
 
 export async function updateComputerPhotoState(id: string, changes: Partial<Pick<ComputerRecord, 'photoRemote' | 'photoNeedsUpload' | 'photoUploadStatus' | 'photoUploadError' | 'photoPendingActorId'>>) {
   const database = await getDatabase()
+  const before = await database.get('computers', id)
+  if (!before) return
+  const preparedPhoto = before.photo ? await preparePhotoForStorage(before.photo) : undefined
   const transaction = database.transaction('computers', 'readwrite')
-  const computer = await transaction.store.get(id)
-  if (computer) await transaction.store.put({ ...computer, ...changes })
-  await transaction.done
+  transaction.done.catch(() => undefined)
+  try {
+    const computer = await transaction.store.get(id)
+    if (!computer || computer.updatedAt !== before.updatedAt || computer.photoLocalRevision !== before.photoLocalRevision) {
+      await transaction.done
+      return
+    }
+    await transaction.store.put({ ...computer, ...changes, photo: preparedPhoto })
+    await transaction.done
+  } catch (storageError) {
+    try { transaction.abort() } catch { /* ya terminó */ }
+    throw describeStorageFailure(storageError)
+  }
 }
 
 export async function queueLocalPhotoMigrations(ownerId: string) {

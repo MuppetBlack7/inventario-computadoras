@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createBackup, restoreBackup } from './backup'
-import { clearAllData, getComputer, getDatabase, getPendingSyncQueue, listComputers, LocalSaveError, preparePhotoForStorage, saveComputer, saveSession, updateComputerSyncState } from './db'
+import { clearAllData, getComputer, getDatabase, getPendingSyncQueue, listComputers, LocalSaveError, prepareComputerForRewrite, preparePhotoForStorage, saveComputer, saveSession, updateComputerSyncState } from './db'
 import type { ComputerRecord } from './types'
 import { normalizeKey } from './utils'
 
@@ -93,6 +93,15 @@ describe('guardado local de equipos con fotografía', () => {
     const fromDatabase = (await getComputer('pc-1'))!
     await saveComputer({ ...fromDatabase, model: 'Otro' }, false)
     expect(await bytesOf((await getComputer('pc-1'))?.photo)).toEqual(await bytesOf(jpeg()))
+  })
+
+  it('materializa un Blob nuevo antes de reescribir estados de sincronización', async () => {
+    await saveComputer({ ...base, photo: jpeg(), photoNeedsUpload: true })
+    const fromDatabase = (await getComputer('pc-1'))!
+    const prepared = await prepareComputerForRewrite(fromDatabase)
+    expect(prepared.photo).not.toBe(fromDatabase.photo)
+    expect(prepared.photo?.type).toBe('image/jpeg')
+    expect(await bytesOf(prepared.photo)).toEqual(await bytesOf(fromDatabase.photo))
   })
 
   it('no altera referencias remotas válidas al actualizar un registro', async () => {

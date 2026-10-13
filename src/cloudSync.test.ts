@@ -228,6 +228,48 @@ describe('actualización compartida de fotografías', () => {
   })
 })
 
+describe('fallos de Blob durante la sincronización local', () => {
+  it('conserva la cola y reutiliza la misma subida si IndexedDB falla al confirmar el estado local', async () => {
+    await saveSession(localSession())
+    await saveComputer({
+      ...localComputer(40),
+      photo: new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], { type: 'image/jpeg' }),
+      photoName: 'equipo.jpg',
+      photoNeedsUpload: true,
+      photoUploadStatus: 'pending',
+      photoLocalRevision: 'blob-revision-1'
+    })
+    const originalPut = IDBObjectStore.prototype.put
+    let reproduced = false
+    const putSpy = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, value: unknown, key?: IDBValidKey) {
+      const record = value as Partial<ComputerRecord>
+      if (!reproduced && this.name === 'computers' && record.syncStatus === 'synced' && record.photoUploadStatus === 'uploaded') {
+        reproduced = true
+        throw new DOMException('Error preparing Blob/File data to be stored in object store', 'UnknownError')
+      }
+      return originalPut.call(this, value, key)
+    })
+
+    const failed = await synchronize('alice')
+    expect(reproduced).toBe(true)
+    expect(failed).toMatchObject({ synced: 1, errors: 1, pending: 1 })
+    expect(failed.lastError).toContain('El navegador no pudo guardar el registro en este dispositivo')
+    expect(photoStore.uploads).toBe(1)
+    const pending = await getPendingSyncQueue()
+    expect(pending.find((item) => item.entityId === 'local-40')).toMatchObject({
+      operation: 'upsert-computer',
+      retryable: true,
+      photoCandidate: { fileId: 'photo-1' }
+    })
+
+    putSpy.mockRestore()
+    const retried = await synchronize('alice', undefined, { force: true })
+    expect(retried.pending).toBe(0)
+    expect(photoStore.uploads).toBe(1)
+    expect((await getComputer('local-40'))?.photoRemote?.fileId).toBe('photo-1')
+  })
+})
+
 describe('descarga incremental de Firestore', () => {
   it('la primera descarga pagina 250 equipos de 4 sesiones y dos usuarios', async () => {
     const result = await pullCloudData('bob', { force: true })

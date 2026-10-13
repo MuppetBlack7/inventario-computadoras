@@ -12,6 +12,7 @@ import {
   listComputers,
   listSessions,
   markSyncQueueFailure,
+  preparePhotoForStorage,
   removeRemoteMirroredComputer,
   removeRemoteMirroredSession,
   queuePendingPhotoUploads,
@@ -64,6 +65,7 @@ export function describeSyncError(error: unknown) {
     unauthenticated: 'La sesión de Google ya no es válida. Vuelve a iniciar sesión.',
     unavailable: 'Firebase no está disponible temporalmente. Se reintentará al recuperar conexión.',
     'network-request-failed': 'No fue posible comunicarse con Firebase.',
+    'local-storage-failed': 'El dispositivo no pudo leer o guardar la fotografía local. La operación sigue pendiente y puede reintentarse.',
     'failed-precondition': 'Firebase requiere una configuración adicional para esta consulta.'
   }
   return messages[code] || (error instanceof Error ? error.message : 'No fue posible actualizar el inventario')
@@ -177,7 +179,8 @@ async function syncItem(ownerId: string, item: SyncQueueItem, scope: SyncScope =
       ? item.photoCandidate
       : undefined
     if (!uploadedCandidate) {
-      uploadedCandidate = await uploadPhotoToImageKit(cloudId, computer.photo, computer.photoName, computer.photoLocalRevision || item.revision || item.id)
+      const uploadPhoto = await preparePhotoForStorage(computer.photo)
+      uploadedCandidate = await uploadPhotoToImageKit(cloudId, uploadPhoto, computer.photoName, computer.photoLocalRevision || item.revision || item.id)
       if (!await savePhotoCandidate(item, uploadedCandidate, computer.photoLocalRevision)) return false
     }
     if (!await isSyncQueueItemCurrent(item)) return false
@@ -230,7 +233,8 @@ async function syncItem(ownerId: string, item: SyncQueueItem, scope: SyncScope =
       } else if (imageKitConfigured) {
         await updateComputerPhotoState(computer.id, { photoUploadStatus: 'uploading', photoUploadError: undefined })
         if (!uploadedCandidate) {
-          uploadedCandidate = await uploadPhotoToImageKit(cloudId, computer.photo, computer.photoName, computer.photoLocalRevision || item.revision || item.id)
+          const uploadPhoto = await preparePhotoForStorage(computer.photo)
+          uploadedCandidate = await uploadPhotoToImageKit(cloudId, uploadPhoto, computer.photoName, computer.photoLocalRevision || item.revision || item.id)
           if (!await savePhotoCandidate(item, uploadedCandidate, computer.photoLocalRevision)) return false
         }
         syncedComputer = { ...computer, photoRemote: uploadedCandidate, photoNeedsUpload: false, photoUploadStatus: 'uploaded', photoUploadError: undefined, photoStoredLocally: false, photoPendingActorId: undefined }
@@ -329,7 +333,7 @@ const operationPriority = (item: SyncQueueItem) => {
 const isTransientSyncError = (error: unknown) => {
   if (!navigator.onLine) return true
   const code = typeof error === 'object' && error && 'code' in error ? String(error.code).replace(/^firestore\//, '') : ''
-  return ['aborted', 'deadline-exceeded', 'internal', 'network-request-failed', 'resource-exhausted', 'unavailable', 'unknown'].includes(code)
+  return ['aborted', 'deadline-exceeded', 'internal', 'local-storage-failed', 'network-request-failed', 'resource-exhausted', 'unavailable', 'unknown'].includes(code)
 }
 
 const syncRuns = new Map<string, { scope: SyncScope; promise: Promise<SyncSummary> }>()
@@ -399,10 +403,14 @@ async function runSynchronize(ownerId: string, report: SyncReporter, options: Sy
         const transient = isTransientSyncError(error)
         await markSyncQueueFailure(item, message, new Date(Date.now() + delay).toISOString(), transient)
         if (item.operation.includes('computer')) {
-          await updateComputerSyncState(item.entityId, 'error', message)
-          if (item.operation === 'upsert-computer' || item.operation === 'update-computer-photo') await updateComputerPhotoState(item.entityId, { photoUploadStatus: 'error', photoUploadError: message })
+          // El error puede provenir precisamente de IndexedDB. Actualizar el indicador es secundario:
+          // nunca debe ocultar el error original ni sacar la operación de la cola.
+          await updateComputerSyncState(item.entityId, 'error', message).catch(() => undefined)
+          if (item.operation === 'upsert-computer' || item.operation === 'update-computer-photo') {
+            await updateComputerPhotoState(item.entityId, { photoUploadStatus: 'error', photoUploadError: message }).catch(() => undefined)
+          }
         }
-        if (item.operation.includes('session')) await updateSessionSyncState(item.entityId, 'error', message)
+        if (item.operation.includes('session')) await updateSessionSyncState(item.entityId, 'error', message).catch(() => undefined)
         if (transient && item.operation !== 'cleanup-photo') {
           stoppedByTransientError = true
           break
