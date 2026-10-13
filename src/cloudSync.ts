@@ -1,10 +1,10 @@
 import { collection, deleteDoc, doc, getCountFromServer, getDoc, getDocs, limit, onSnapshot, orderBy, query, setDoc, startAfter, where, type DocumentChange, type DocumentData, type QueryConstraint, type QueryDocumentSnapshot, type Unsubscribe } from 'firebase/firestore'
 import {
+  applyRemoteComputer,
+  applyRemoteSession,
   completeComputerSync,
   completeDeleteSync,
   completeSessionSync,
-  deleteComputer,
-  deleteLocalSession,
   getComputer,
   getDatabase,
   getPendingSyncQueue,
@@ -12,10 +12,11 @@ import {
   listComputers,
   listSessions,
   markSyncQueueFailure,
+  removeRemoteMirroredComputer,
+  removeRemoteMirroredSession,
+  queuePendingPhotoUploads,
   queuePhotoCleanup,
   savePhotoCandidate,
-  saveComputer,
-  saveSession,
   updateComputerPhotoState,
   updateComputerSyncState,
   updateSessionSyncState
@@ -28,6 +29,8 @@ const SHARED_SESSIONS = 'inventorySessions'
 const SHARED_COMPUTERS = 'inventoryComputers'
 
 export interface SyncSummary {
+  /** La sincronización está detenida a propósito (recuperación pendiente o modo local): no se intentó nada. */
+  held?: boolean
   synced: number
   errors: number
   photosLocalOnly: number
@@ -109,14 +112,33 @@ async function findRemoteDuplicate(computer: ComputerRecord) {
   ]
   for (const [field, value] of fields) {
     if (!value) continue
-    const snapshot = await getDocs(query(computers, where(field, '==', value), limit(1)))
-    const match = snapshot.docs[0]
+    const snapshot = await getDocs(query(computers, where(field, '==', value), limit(25)))
+    // Un inventario repetido (p. ej. "NO ETIQUETADO") con series distintas corresponde a equipos distintos.
+    const match = snapshot.docs.find((entry) => {
+      const data = entry.data() as Partial<ComputerRecord>
+      return field === 'serialNormalized' || !computer.serialNormalized || !data.serialNormalized || data.serialNormalized === computer.serialNormalized
+    })
     if (match) return match.id
   }
   return undefined
 }
 
-async function syncItem(ownerId: string, item: SyncQueueItem) {
+/**
+ * Alcance de una sincronización:
+ * - all: todo lo propio (comportamiento normal).
+ * - operations: solo operaciones propias sobre sesiones y equipos; no sube fotografías ni ejecuta limpiezas de ImageKit.
+ * - photos: solo equipos propios con fotografía pendiente de subir.
+ * En ningún alcance se ejecutan operaciones de otra cuenta ni sobre registros ajenos.
+ */
+export type SyncScope = 'all' | 'operations' | 'photos'
+export interface SyncOptions {
+  force?: boolean
+  scope?: SyncScope
+  /** Identificadores de equipos o sesiones (locales o remotos) que no deben tocarse en esta ejecución. */
+  exclude?: ReadonlySet<string>
+}
+
+async function syncItem(ownerId: string, item: SyncQueueItem, scope: SyncScope = 'all') {
   if (!firestore) throw new Error('Firestore no está configurado')
   if (item.ownerId !== ownerId) return false
   // Una operación terminada tarde nunca puede ejecutar efectos sobre una revisión más nueva.
@@ -142,7 +164,11 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
     await updateComputerSyncState(computer.id, 'syncing')
     const duplicateId = await findRemoteDuplicate(computer)
     const knownId = computer.cloudId || computer.id
-    if (duplicateId && duplicateId !== knownId) throw new Error('Ya existe un equipo con el mismo número de serie o inventario')
+    if (duplicateId && duplicateId !== knownId) {
+      // Una coincidencia de clave no demuestra que sean el mismo equipo. Conserva la copia
+      // local y su operación pendiente para que la recuperación pueda revisar ambos registros.
+      throw new Error(`Posible duplicado remoto ${duplicateId}: requiere revisión antes de sincronizar`)
+    }
     const cloudId = duplicateId || knownId
     const reference = doc(firestore, SHARED_COMPUTERS, cloudId)
     if (!await isSyncQueueItemCurrent(item)) return false
@@ -154,7 +180,9 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
       ? item.photoCandidate
       : undefined
     if (computer.photo && (computer.photoNeedsUpload || !computer.photoRemote)) {
-      if (imageKitConfigured) {
+      if (scope === 'operations') {
+        // Alcance «solo operaciones»: la fotografía no se sube ni cambia de estado; sigue pendiente para su propio alcance.
+      } else if (imageKitConfigured) {
         await updateComputerPhotoState(computer.id, { photoUploadStatus: 'uploading', photoUploadError: undefined })
         if (!uploadedCandidate) {
           uploadedCandidate = await uploadPhotoToImageKit(cloudId, computer.photo, computer.photoName)
@@ -193,7 +221,9 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
   }
 
   if (item.operation === 'delete-session') {
-    const computerDeletes = (await getPendingSyncQueue()).filter((queued) => queued.operation === 'delete-computer' && queued.sessionId === item.entityId)
+    // Solo se esperan las bajas de equipos del mismo propietario autenticado. Las de otras cuentas no se pueden ejecutar aquí:
+    // se dejan intactas en la cola y no bloquean esta baja.
+    const computerDeletes = (await getPendingSyncQueue()).filter((queued) => queued.operation === 'delete-computer' && queued.sessionId === item.entityId && queued.ownerId === ownerId)
     if (computerDeletes.length) return false
     const reference = doc(firestore, SHARED_SESSIONS, item.remoteId || item.entityId)
     // Si nunca llegó a Firestore no hay nada que borrar (las reglas rechazan borrar documentos inexistentes).
@@ -228,6 +258,7 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
     return completeDeleteSync(item)
   }
   if (item.operation === 'cleanup-photo') {
+    if (scope !== 'all') return false
     if (!item.photoFileId) return completeDeleteSync(item)
     if (item.blockedByQueueItemId && (await getPendingSyncQueue()).some((queued) => queued.id === item.blockedByQueueItemId)) return false
     if (!imageKitConfigured) throw new Error('ImageKit está pendiente de configurar')
@@ -237,7 +268,6 @@ async function syncItem(ownerId: string, item: SyncQueueItem) {
   return false
 }
 
-const syncInFlight = new Map<string, Promise<SyncSummary>>()
 const RETRY_BASE_MS = 1_000
 const RETRY_MAX_MS = 60_000
 
@@ -255,19 +285,41 @@ const isTransientSyncError = (error: unknown) => {
   return ['aborted', 'deadline-exceeded', 'internal', 'network-request-failed', 'resource-exhausted', 'unavailable', 'unknown'].includes(code)
 }
 
-export function synchronize(ownerId: string, report: SyncReporter = () => undefined, options: { force?: boolean } = {}): Promise<SyncSummary> {
-  const running = syncInFlight.get(ownerId)
-  if (running) return running
-  const promise = runSynchronize(ownerId, report, options).finally(() => syncInFlight.delete(ownerId))
-  syncInFlight.set(ownerId, promise)
+const syncRuns = new Map<string, { scope: SyncScope; promise: Promise<SyncSummary> }>()
+
+export function synchronize(ownerId: string, report: SyncReporter = () => undefined, options: SyncOptions = {}): Promise<SyncSummary> {
+  const scope = options.scope ?? 'all'
+  const running = syncRuns.get(ownerId)
+  if (running) {
+    // Una ejecución idéntica comparte el resultado. Con otro alcance o exclusiones se espera y se ejecuta después, nunca en paralelo.
+    if (scope === 'all' && running.scope === 'all' && !options.exclude?.size) return running.promise
+    return running.promise.catch(() => undefined).then(() => synchronize(ownerId, report, options))
+  }
+  const promise = runSynchronize(ownerId, report, options).finally(() => { if (syncRuns.get(ownerId)?.promise === promise) syncRuns.delete(ownerId) })
+  syncRuns.set(ownerId, { scope, promise })
   return promise
 }
 
-async function runSynchronize(ownerId: string, report: SyncReporter, options: { force?: boolean }): Promise<SyncSummary> {
+async function runSynchronize(ownerId: string, report: SyncReporter, options: SyncOptions): Promise<SyncSummary> {
+  const scope = options.scope ?? 'all'
   if (!firestore) throw new Error('Firebase no está configurado')
   if (!navigator.onLine) {
     report('local', 'Guardado local')
     return { synced: 0, errors: 0, photosLocalOnly: 0, pending: await pendingCount(ownerId) }
+  }
+  // Las fotografías que esperaban a ImageKit (o a un reintento) vuelven a la cola sin necesidad de reimportar nada.
+  if (imageKitConfigured && scope !== 'operations') await queuePendingPhotoUploads(ownerId, options.exclude)
+  const pendingPhotoEntities = new Set<string>()
+  if (scope === 'photos') {
+    for (const computer of await listComputers()) {
+      if (computer.ownerId === ownerId && computer.photo && (computer.photoNeedsUpload || !computer.photoRemote)) { pendingPhotoEntities.add(computer.id); if (computer.cloudId) pendingPhotoEntities.add(computer.cloudId) }
+    }
+  }
+  const inScope = (item: SyncQueueItem) => {
+    if (options.exclude?.has(item.entityId) || (item.remoteId && options.exclude?.has(item.remoteId))) return false
+    if (scope === 'operations') return item.operation !== 'cleanup-photo'
+    if (scope === 'photos') return item.operation === 'upsert-computer' && pendingPhotoEntities.has(item.entityId)
+    return true
   }
   const initialQueue = (await getPendingSyncQueue()).filter((item) => item.ownerId === ownerId)
   if (!initialQueue.length) {
@@ -284,13 +336,13 @@ async function runSynchronize(ownerId: string, report: SyncReporter, options: { 
   for (let pass = 0; pass < 20; pass += 1) {
     const now = Date.now()
     const queue = (await getPendingSyncQueue())
-      .filter((item) => item.ownerId === ownerId && !processed.has(`${item.id}:${item.revision || item.createdAt}`) && (options.force || !item.nextAttemptAt || Date.parse(item.nextAttemptAt) <= now))
+      .filter((item) => item.ownerId === ownerId && inScope(item) && !processed.has(`${item.id}:${item.revision || item.createdAt}`) && (options.force || !item.nextAttemptAt || Date.parse(item.nextAttemptAt) <= now))
       .sort((left, right) => operationPriority(left) - operationPriority(right) || left.createdAt.localeCompare(right.createdAt))
     if (!queue.length) break
     for (const item of queue) {
       processed.add(`${item.id}:${item.revision || item.createdAt}`)
       try {
-        const didSync = await syncItem(ownerId, item)
+        const didSync = await syncItem(ownerId, item, scope)
         if (didSync) synced += 1
       } catch (error) {
         errors += 1
@@ -404,7 +456,7 @@ async function fetchPages(name: string, since?: string) {
   return docs
 }
 
-async function loadRemote(name: string, localSharedCount: number, pendingDeleteCount: number, force: boolean) {
+async function loadRemote(name: string, localSharedCount: number, pendingDeleteCount: number, force: boolean, exclude: ReadonlySet<string> = new Set()) {
   const cursor = readMeta(cursorKey(name))
   const lastFull = Number(readMeta(reconcileKey(name)) || 0)
   const stale = Date.now() - lastFull > FULL_RECONCILE_MIN_INTERVAL_MS
@@ -427,8 +479,12 @@ async function loadRemote(name: string, localSharedCount: number, pendingDeleteC
     reads += docs.length
     writeMeta(reconcileKey(name), String(Date.now()))
   }
+  // Con exclusiones el cursor nunca pasa del documento omitido más antiguo: los omitidos se volverán a descargar
+  // en la siguiente descarga incremental y no se pierden ni se omiten de forma permanente.
+  const skippedAt = docs.filter((entry) => exclude.has(entry.id)).map((entry) => String(entry.data().updatedAt || '')).sort()[0]
   const newest = docs.reduce((max, entry) => {
     const value = String(entry.data().updatedAt || '')
+    if (exclude.has(entry.id) || (skippedAt !== undefined && value >= skippedAt)) return max
     return value > max ? value : max
   }, cursor || '')
   if (newest) writeMeta(cursorKey(name), newest)
@@ -437,18 +493,28 @@ async function loadRemote(name: string, localSharedCount: number, pendingDeleteC
 
 let pullInFlight: { force: boolean; promise: Promise<PullStats> } | undefined
 
+export interface PullOptions {
+  force?: boolean
+  /** Registros (identificadores locales o remotos) que no deben actualizarse ni eliminarse en esta descarga. */
+  exclude?: ReadonlySet<string>
+  /** No elimina registros locales aunque ya no existan en Firestore (solo agrega y actualiza). */
+  keepLocalRecords?: boolean
+}
+
 /**
  * Sincroniza hacia el dispositivo solo los documentos nuevos o modificados (paginado, orderBy + limit + startAfter).
  * Las llamadas simultáneas comparten la misma consulta. `force` hace una reconciliación completa.
  */
-export function pullCloudData(_ownerId: string, options: { force?: boolean } = {}): Promise<PullStats> {
+export function pullCloudData(_ownerId: string, options: PullOptions = {}): Promise<PullStats> {
   if (!firestore || !navigator.onLine) return Promise.resolve({ sessions: 0, computers: 0, reads: 0 })
   const force = Boolean(options.force)
+  const exclude = options.exclude
+  const keepLocal = Boolean(options.keepLocalRecords)
   if (pullInFlight) {
-    if (!force || pullInFlight.force) return pullInFlight.promise
-    return pullInFlight.promise.then(() => pullCloudData(_ownerId, { force: true }))
+    if (!exclude?.size && !keepLocal && (!force || pullInFlight.force)) return pullInFlight.promise
+    return pullInFlight.promise.catch(() => undefined).then(() => pullCloudData(_ownerId, options))
   }
-  const promise = runPull(force).finally(() => {
+  const promise = runPull(force, exclude, keepLocal).finally(() => {
     if (pullInFlight?.promise === promise) pullInFlight = undefined
   })
   pullInFlight = { force, promise }
@@ -477,7 +543,8 @@ export function synchronizeAndPull(ownerId: string, report: SyncReporter = () =>
   return promise
 }
 
-async function runPull(force: boolean): Promise<PullStats> {
+async function runPull(force: boolean, exclude: ReadonlySet<string> = new Set(), keepLocalRecords = false): Promise<PullStats> {
+  const skipped = (...ids: Array<string | undefined>) => ids.some((id) => id && exclude.has(id))
   const [localSessions, localComputers, queue] = await Promise.all([listSessions(), listComputers(), getPendingSyncQueue()])
   // Borrados pendientes: no se vuelven a descargar mientras Firestore no los confirme.
   const pendingDeletes = queue.filter((item) => item.operation.startsWith('delete-'))
@@ -491,51 +558,37 @@ async function runPull(force: boolean): Promise<PullStats> {
     new Set(items.filter((item) => item.sharedCloud).map((item) => item.cloudId || item.id)).size
 
   const [sessionsResult, computersResult] = await Promise.all([
-    loadRemote(SHARED_SESSIONS, sharedCount(localSessions), pendingDeletes.filter((item) => item.operation === 'delete-session').length, force),
-    loadRemote(SHARED_COMPUTERS, sharedCount(localComputers), pendingDeletes.filter((item) => item.operation === 'delete-computer').length, force)
+    loadRemote(SHARED_SESSIONS, sharedCount(localSessions), pendingDeletes.filter((item) => item.operation === 'delete-session').length, force, exclude),
+    loadRemote(SHARED_COMPUTERS, sharedCount(localComputers), pendingDeletes.filter((item) => item.operation === 'delete-computer').length, force, exclude)
   ])
 
   for (const snapshot of sessionsResult.docs) {
     if (deletedSessions.has(snapshot.id)) continue
     const remote = snapshot.data() as InventorySession
     const local = localSessions.find((item) => item.cloudId === snapshot.id || item.id === snapshot.id)
-    if (sessionPending(local?.id, snapshot.id)) continue
-    await saveSession({ ...remote, id: local?.id || remote.id || snapshot.id, cloudId: snapshot.id, sharedCloud: true, syncStatus: 'synced', syncError: undefined }, false)
+    if (sessionPending(local?.id, snapshot.id) || skipped(snapshot.id, local?.id)) continue
+    await applyRemoteSession({ ...remote, id: local?.id || remote.id || snapshot.id, cloudId: snapshot.id })
   }
 
   for (const snapshot of computersResult.docs) {
     if (deletedComputers.has(snapshot.id)) continue
     const remote = snapshot.data() as ComputerRecord
     const local = localComputers.find((item) => item.cloudId === snapshot.id || item.id === snapshot.id)
-    if (computerPending(local?.id, snapshot.id)) continue
-    const keepLocalPhoto = Boolean(local?.photoNeedsUpload) || Boolean(local?.photoRemote?.fileId && local.photoRemote.fileId === remote.photoRemote?.fileId)
-    await saveComputer({
-      ...remote,
-      equipmentType: remote.equipmentType || '',
-      id: local?.id || remote.id || snapshot.id,
-      cloudId: snapshot.id,
-      sharedCloud: true,
-      photo: keepLocalPhoto ? local?.photo : undefined,
-      photoNeedsUpload: keepLocalPhoto ? local?.photoNeedsUpload : false,
-      photoUploadStatus: remote.photoRemote ? 'uploaded' : local?.photoUploadStatus,
-      photoUploadError: keepLocalPhoto ? local?.photoUploadError : undefined,
-      photoLocalRevision: keepLocalPhoto ? local?.photoLocalRevision : undefined,
-      syncStatus: 'synced',
-      syncError: undefined
-    }, false)
+    if (computerPending(local?.id, snapshot.id) || skipped(snapshot.id, local?.id)) continue
+    await applyRemoteComputer({ ...remote, id: local?.id || remote.id || snapshot.id, cloudId: snapshot.id })
   }
 
   // Solo una descarga completa permite saber qué documentos desaparecieron de Firestore.
-  if (computersResult.full) {
+  if (computersResult.full && !keepLocalRecords) {
     const ids = new Set(computersResult.docs.map((entry) => entry.id))
-    for (const computer of localComputers.filter((item) => item.sharedCloud && !computerPending(item.id, item.cloudId || item.id) && !ids.has(item.cloudId || item.id))) {
-      await deleteComputer(computer.id, computer.ownerId, false)
+    for (const computer of localComputers.filter((item) => item.sharedCloud && !skipped(item.id, item.cloudId) && !computerPending(item.id, item.cloudId || item.id) && !ids.has(item.cloudId || item.id))) {
+      await removeRemoteMirroredComputer(computer.id, computer.cloudId)
     }
   }
-  if (sessionsResult.full) {
+  if (sessionsResult.full && !keepLocalRecords) {
     const ids = new Set(sessionsResult.docs.map((entry) => entry.id))
-    for (const session of localSessions.filter((item) => item.sharedCloud && !sessionPending(item.id, item.cloudId || item.id) && !ids.has(item.cloudId || item.id))) {
-      await deleteLocalSession(session.id)
+    for (const session of localSessions.filter((item) => item.sharedCloud && !skipped(item.id, item.cloudId) && !sessionPending(item.id, item.cloudId || item.id) && !ids.has(item.cloudId || item.id))) {
+      await removeRemoteMirroredSession(session.id, session.cloudId)
     }
   }
   return { sessions: sessionsResult.docs.length, computers: computersResult.docs.length, reads: sessionsResult.reads + computersResult.reads }
@@ -550,15 +603,11 @@ async function applySessionChanges(changes: Array<DocumentChange<DocumentData>>)
     const pending = queue.some((item) => item.operation.includes('session') && (item.entityId === local?.id || item.entityId === change.doc.id || item.remoteId === change.doc.id))
     if (pending) continue
     if (change.type === 'removed') {
-      if (local) {
-        await deleteLocalSession(local.id)
-        removed += 1
-      }
+      if (local && await removeRemoteMirroredSession(local.id, local.cloudId)) removed += 1
       continue
     }
     const remote = change.doc.data() as InventorySession
-    await saveSession({ ...remote, id: local?.id || remote.id || change.doc.id, cloudId: change.doc.id, sharedCloud: true, syncStatus: 'synced', syncError: undefined }, false)
-    applied += 1
+    if (await applyRemoteSession({ ...remote, id: local?.id || remote.id || change.doc.id, cloudId: change.doc.id })) applied += 1
   }
   return { applied, removed }
 }
@@ -572,29 +621,11 @@ async function applyComputerChanges(changes: Array<DocumentChange<DocumentData>>
     const pending = queue.some((item) => item.operation.includes('computer') && (item.entityId === local?.id || item.entityId === change.doc.id || item.remoteId === change.doc.id))
     if (pending) continue
     if (change.type === 'removed') {
-      if (local) {
-        await deleteComputer(local.id, local.ownerId, false)
-        removed += 1
-      }
+      if (local && await removeRemoteMirroredComputer(local.id, local.cloudId)) removed += 1
       continue
     }
     const remote = change.doc.data() as ComputerRecord
-    const keepLocalPhoto = Boolean(local?.photoNeedsUpload) || Boolean(local?.photoRemote?.fileId && local.photoRemote.fileId === remote.photoRemote?.fileId)
-    await saveComputer({
-      ...remote,
-      equipmentType: remote.equipmentType || '',
-      id: local?.id || remote.id || change.doc.id,
-      cloudId: change.doc.id,
-      sharedCloud: true,
-      photo: keepLocalPhoto ? local?.photo : undefined,
-      photoNeedsUpload: keepLocalPhoto ? local?.photoNeedsUpload : false,
-      photoUploadStatus: remote.photoRemote ? 'uploaded' : keepLocalPhoto ? local?.photoUploadStatus : undefined,
-      photoUploadError: keepLocalPhoto ? local?.photoUploadError : undefined,
-      photoLocalRevision: keepLocalPhoto ? local?.photoLocalRevision : undefined,
-      syncStatus: 'synced',
-      syncError: undefined
-    }, false)
-    applied += 1
+    if (await applyRemoteComputer({ ...remote, id: local?.id || remote.id || change.doc.id, cloudId: change.doc.id })) applied += 1
   }
   return { applied, removed }
 }
@@ -650,7 +681,37 @@ export async function pendingCount(ownerId: string | null) {
   return (await getPendingSyncQueue()).filter((item) => ownerId ? item.ownerId === ownerId : !item.ownerId).length
 }
 
+/** Operaciones propias que fallaron y siguen en la cola (solo lectura). */
+export async function failedCount(ownerId: string | null) {
+  return (await getPendingSyncQueue()).filter((item) => (ownerId ? item.ownerId === ownerId : !item.ownerId) && Boolean(item.lastError)).length
+}
+
 export async function resetSyncQueueForTests() {
   const database = await getDatabase()
   await database.clear('syncQueue')
+}
+
+export interface RemoteVerification {
+  confirmed: number
+  missing: string[]
+  foreign: string[]
+  stillPresent: string[]
+}
+
+/** Lee directamente de Firestore para confirmar que los documentos existen con el propietario correcto (o que ya no existen). */
+export async function verifyRemoteDocuments(ownerId: string, expected: { sessions: string[]; computers: string[]; deletedComputers: string[] }): Promise<RemoteVerification> {
+  if (!firestore) throw new Error('Firebase no está configurado')
+  const result: RemoteVerification = { confirmed: 0, missing: [], foreign: [], stillPresent: [] }
+  const check = async (collectionName: string, id: string, label: string) => {
+    const snapshot = await getDoc(doc(firestore!, collectionName, id))
+    if (!snapshot.exists()) result.missing.push(`${label} ${id} no existe en Firebase`)
+    else if (snapshot.data()?.ownerId !== ownerId) result.foreign.push(`${label} ${id} pertenece a otra cuenta`)
+    else result.confirmed += 1
+  }
+  for (const id of new Set(expected.sessions)) await check(SHARED_SESSIONS, id, 'La sesión')
+  for (const id of new Set(expected.computers)) await check(SHARED_COMPUTERS, id, 'El equipo')
+  for (const id of new Set(expected.deletedComputers)) {
+    if ((await getDoc(doc(firestore, SHARED_COMPUTERS, id))).exists()) result.stillPresent.push(`El equipo ${id} sigue existiendo en Firebase`)
+  }
+  return result
 }

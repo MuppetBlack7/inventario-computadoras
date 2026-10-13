@@ -44,8 +44,31 @@ const createFirestore = (): Firestore | null => {
 export const firestore = createFirestore()
 export const firebaseStorage = app && storageEnabled ? getStorage(app) : null
 
-let persistencePromise: Promise<void> | undefined
+type PersistenceKind = 'indexedDB' | 'local' | 'default'
+let persistencePromise: Promise<PersistenceKind> | undefined
 let redirectResultPromise: Promise<User | null> | undefined
+
+const REDIRECT_PENDING_KEY = 'inventario.auth.redirectPending'
+
+const authDebugEnabled = () => {
+  try { return import.meta.env.DEV || localStorage.getItem('inventario.authDebug') === '1' } catch { return Boolean(import.meta.env.DEV) }
+}
+
+/** Diagnóstico de autenticación: solo registra eventos y códigos de error, nunca tokens, correos ni identificadores. */
+export function authLog(event: string, detail?: Record<string, unknown>) {
+  if (!authDebugEnabled()) return
+  console.info(`[auth] ${event}`, detail ?? '')
+}
+
+const errorSummary = (error: unknown) => ({
+  code: typeof error === 'object' && error && 'code' in error ? String(error.code) : undefined,
+  message: error instanceof Error ? error.message : String(error)
+})
+
+const readPendingRedirect = () => { try { return sessionStorage.getItem(REDIRECT_PENDING_KEY) === '1' } catch { return false } }
+const writePendingRedirect = (value: boolean) => {
+  try { if (value) sessionStorage.setItem(REDIRECT_PENDING_KEY, '1'); else sessionStorage.removeItem(REDIRECT_PENDING_KEY) } catch { /* almacenamiento bloqueado */ }
+}
 
 export function describeFirebaseAuthError(error: unknown) {
   const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : ''
@@ -56,29 +79,84 @@ export function describeFirebaseAuthError(error: unknown) {
     'auth/operation-not-supported-in-this-environment': 'Este navegador no puede abrir el flujo de acceso configurado.',
     'auth/account-exists-with-different-credential': 'Esta cuenta ya usa otro método de acceso.',
     'auth/popup-blocked': 'El navegador bloqueó la ventana de acceso.',
+    'auth/popup-closed-by-user': 'Se cerró la ventana de Google antes de terminar el acceso.',
+    'auth/cancelled-popup-request': 'Ya hay una ventana de acceso abierta.',
+    'auth/redirect-result-lost': 'Google devolvió a la aplicación pero el navegador no conservó el resultado del acceso (almacenamiento de terceros bloqueado). Inicia sesión de nuevo con la ventana emergente.',
     'auth/network-request-failed': 'No fue posible comunicarse con Firebase. Revisa la conexión.'
   }
   const summary = messages[code] || details
   return code ? `${code}: ${summary}` : summary
 }
 
-async function configureAuthPersistence() {
-  if (!firebaseAuth) return
+async function configureAuthPersistence(): Promise<PersistenceKind> {
+  if (!firebaseAuth) return 'default'
   if (!persistencePromise) {
-    persistencePromise = setPersistence(firebaseAuth, indexedDBLocalPersistence)
-      .catch(() => setPersistence(firebaseAuth!, browserLocalPersistence))
+    const auth = firebaseAuth
+    authLog('persistence:start')
+    persistencePromise = setPersistence(auth, indexedDBLocalPersistence)
+      .then((): PersistenceKind => 'indexedDB')
+      .catch((error) => {
+        authLog('persistence:indexedDB-failed', errorSummary(error))
+        return setPersistence(auth, browserLocalPersistence).then((): PersistenceKind => 'local')
+      })
+      .catch((error): PersistenceKind => {
+        // El SDK conserva su persistencia por defecto; no se bloquea el acceso ni se guarda un rechazo.
+        authLog('persistence:fallback-failed', errorSummary(error))
+        return 'default'
+      })
+      .then((kind) => { authLog('persistence:done', { kind }); return kind })
   }
-  await persistencePromise
+  return persistencePromise
 }
 
-export async function prepareFirebaseAuth() {
-  if (!firebaseAuth) return null
-  await configureAuthPersistence()
+/**
+ * Inicializa la autenticación una sola vez: persistencia, resultado de redirección y restauración de la sesión.
+ * Las llamadas simultáneas comparten la misma promesa; si falla, la siguiente llamada puede reintentar.
+ */
+export function prepareFirebaseAuth(): Promise<User | null> {
+  if (!firebaseAuth) return Promise.resolve(null)
   if (!redirectResultPromise) {
-    redirectResultPromise = getRedirectResult(firebaseAuth).then((result) => result?.user || firebaseAuth.currentUser || null)
+    const auth = firebaseAuth
+    authLog('init:start')
+    const promise = (async () => {
+      await configureAuthPersistence()
+      let redirectUser: User | null = null
+      try {
+        const result = await getRedirectResult(auth)
+        redirectUser = result?.user ?? null
+        authLog('redirect-result', { outcome: result?.user ? 'user' : 'null' })
+      } catch (error) {
+        authLog('redirect-result', { outcome: 'error', ...errorSummary(error) })
+        writePendingRedirect(false)
+        throw error
+      }
+      // Espera a que el SDK termine de restaurar la sesión guardada antes de decidir que no hay usuario.
+      await auth.authStateReady?.()
+      const user = redirectUser || auth.currentUser
+      authLog('init:done', { user: Boolean(user) })
+      if (readPendingRedirect()) {
+        writePendingRedirect(false)
+        if (!user) throw Object.assign(new Error('El resultado de la redirección de Google no estaba disponible.'), { code: 'auth/redirect-result-lost' })
+      }
+      return user
+    })()
+    redirectResultPromise = promise
+    promise.catch(() => { if (redirectResultPromise === promise) redirectResultPromise = undefined })
   }
-  await redirectResultPromise
   return redirectResultPromise
+}
+
+const REDIRECT_FALLBACK_CODES = ['auth/popup-blocked', 'auth/operation-not-supported-in-this-environment']
+
+async function redirectToGoogle(auth: NonNullable<typeof firebaseAuth>, provider: GoogleAuthProvider) {
+  writePendingRedirect(true)
+  authLog('redirect:start')
+  try {
+    await signInWithRedirect(auth, provider)
+  } catch (error) {
+    writePendingRedirect(false)
+    throw error
+  }
 }
 
 export async function signInWithGoogle() {
@@ -86,18 +164,22 @@ export async function signInWithGoogle() {
   await configureAuthPersistence()
   const provider = new GoogleAuthProvider()
   provider.setCustomParameters({ prompt: 'select_account' })
-  const isIOS = isAppleMobilePlatform(navigator)
-  const isLocalDevelopment = ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname)
-  if (isIOS || isLocalDevelopment) {
-    await signInWithRedirect(firebaseAuth, provider)
+  // Safari/iOS conserva la redirección. En el resto, incluido localhost, la ventana emergente es el flujo principal:
+  // en localhost el dominio de autenticación (firebaseapp.com) es de otro sitio y los navegadores modernos
+  // aíslan su almacenamiento, por lo que el resultado de una redirección no llega a la aplicación.
+  if (isAppleMobilePlatform(navigator)) {
+    await redirectToGoogle(firebaseAuth, provider)
     return
   }
   try {
+    authLog('popup:start')
     await signInWithPopup(firebaseAuth, provider)
+    authLog('popup:done', { user: Boolean(firebaseAuth.currentUser) })
   } catch (error) {
-    const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : ''
-    if (['auth/popup-blocked', 'auth/popup-closed-by-user', 'auth/cancelled-popup-request', 'auth/operation-not-supported-in-this-environment'].includes(code)) {
-      await signInWithRedirect(firebaseAuth, provider)
+    const summary = errorSummary(error)
+    authLog('popup:error', summary)
+    if (summary.code && REDIRECT_FALLBACK_CODES.includes(summary.code)) {
+      await redirectToGoogle(firebaseAuth, provider)
       return
     }
     throw error

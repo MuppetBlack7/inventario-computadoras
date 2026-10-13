@@ -1,6 +1,7 @@
-import { listVisibleComputers, listVisibleSessions, mergeAllData, replaceAllData, saveComputer, saveSession } from './db'
-import type { ComputerRecord, InventoryBackup } from './types'
-import { dataUrlToBlob, downloadBlob, photoToDataUrl } from './utils'
+import { listComputers, listSessions, listVisibleComputers, listVisibleSessions } from './db'
+import type { InventoryBackup } from './types'
+import { downloadBlob, photoToDataUrl } from './utils'
+import { applyRestore, assertBackupStructure, planRestore, type RestoreOptions } from './restore'
 import { downloadRemotePhoto } from './imageKitClient'
 
 export async function createBackup(ownerId: string | null = null): Promise<InventoryBackup> {
@@ -27,39 +28,24 @@ export async function downloadBackup(ownerId: string | null = null) {
 }
 
 export async function readBackupFile(file: File): Promise<InventoryBackup> {
-  const parsed: unknown = JSON.parse(await file.text())
-  if (!parsed || typeof parsed !== 'object') throw new Error('El archivo no contiene un respaldo válido')
-  const backup = parsed as Partial<InventoryBackup>
-  if (backup.format !== 'inventario-computadoras' || backup.version !== 1) {
-    throw new Error('Formato o versión de respaldo no compatible')
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(await file.text())
+  } catch {
+    throw new Error('El archivo no es un JSON válido')
   }
-  if (!Array.isArray(backup.sessions) || !Array.isArray(backup.computers)) {
-    throw new Error('El respaldo está incompleto')
-  }
-  return backup as InventoryBackup
+  return assertBackupStructure(parsed)
 }
 
+/**
+ * Restaura todas las categorías del respaldo (modo combinar o reemplazar) y encola su sincronización.
+ * La interfaz usa `planRestore` y `applyRestore` directamente para elegir categorías.
+ */
 export async function restoreBackup(backup: InventoryBackup, replace: boolean, ownerId: string | null = null) {
-  const sessions = backup.sessions.map<InventoryBackup['sessions'][number]>((session) => {
-    const recordOwner = session.ownerId || ownerId || undefined
-    return { ...session, ownerId: recordOwner, sharedCloud: Boolean(session.cloudId), syncStatus: recordOwner === ownerId ? 'local' : 'synced', syncError: undefined }
-  })
-  const computers: ComputerRecord[] = backup.computers.map(({ photoDataUrl, ...computer }) => ({
-    ...computer,
-    equipmentType: computer.equipmentType || '',
-    ownerId: computer.ownerId || ownerId || undefined,
-    sharedCloud: Boolean(computer.cloudId),
-    syncStatus: (computer.ownerId || ownerId) === ownerId ? 'local' : 'synced',
-    syncError: undefined,
-    photo: photoDataUrl ? dataUrlToBlob(photoDataUrl) : undefined,
-    photoNeedsUpload: Boolean(photoDataUrl && !computer.photoRemote),
-    photoUploadStatus: computer.photoRemote ? 'uploaded' : photoDataUrl ? 'pending' : computer.photoUploadStatus
-  }))
-  if (replace) await replaceAllData(sessions, computers)
-  else await mergeAllData(sessions, computers)
-  if (ownerId) {
-    for (const session of sessions.filter((item) => item.ownerId === ownerId)) await saveSession(session, true)
-    for (const computer of computers.filter((item) => item.ownerId === ownerId)) await saveComputer(computer, true)
-  }
-  return { sessions: sessions.length, computers: computers.length }
+  const mode = replace ? 'replace' : 'merge'
+  const options: RestoreOptions = { sessions: { enabled: true, mode }, computers: { enabled: true, mode }, photos: { enabled: true, mode } }
+  const plan = planRestore(backup, options, { sessions: await listSessions(), computers: await listComputers() }, ownerId)
+  if (plan.blocking.length || !ownerId) throw new Error(plan.blocking[0] || 'Inicia sesión para restaurar')
+  const result = await applyRestore(plan, ownerId)
+  return { sessions: result.created.sessions + result.updated.sessions, computers: result.created.computers + result.updated.computers }
 }

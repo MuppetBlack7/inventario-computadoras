@@ -6,7 +6,8 @@ const store = vi.hoisted(() => ({
   data: new Map<string, Map<string, Row>>(), reads: 0, setCalls: 0, activeSets: 0, maxActiveSets: 0,
   failSetAt: 0, failReads: false, setDelayMs: 0, deleteLog: [] as string[],
   listeners: new Map<string, Set<{ next: (snapshot: { docChanges: () => unknown[] }) => void; error: (error: Error) => void }>>(),
-  setHook: undefined as undefined | ((ref: { name: string; id: string }, row: Row) => Promise<void>)
+  setHook: undefined as undefined | ((ref: { name: string; id: string }, row: Row) => Promise<void>),
+  getDocsHook: undefined as undefined | ((name: string) => Promise<void>)
 }))
 const photoStore = vi.hoisted(() => ({
   failUpload: false,
@@ -28,6 +29,7 @@ vi.mock('firebase/firestore', () => {
     limit: (n: number) => ({ kind: 'limit', n }),
     query: (base: { name: string }, ...constraints: Array<Record<string, unknown>>) => ({ name: base.name, constraints }),
     getDocs: async (q: { name: string; constraints: Array<Record<string, any>> }) => {
+      if (store.getDocsHook) await store.getDocsHook(q.name)
       if (store.failReads) throw Object.assign(new Error('Permiso denegado'), { code: 'permission-denied' })
       let rows = [...(store.data.get(q.name) ?? new Map<string, Row>()).entries()]
       for (const c of q.constraints) if (c.kind === 'where') rows = rows.filter(([, row]) => c.op === '==' ? row[c.field] === c.value : String(row[c.field]) >= String(c.value))
@@ -96,7 +98,7 @@ vi.mock('./imageKitClient', () => ({
   })
 }))
 
-import { clearAllData, deleteComputer, deleteSessionAndComputers, getPendingSyncQueue, listComputers, listSessions, listVisibleComputers, queuePhotoCleanup, saveComputer, saveSession } from './db'
+import { getComputer, getDatabase, clearAllData, deleteComputer, deleteSessionAndComputers, getPendingSyncQueue, listComputers, listSessions, listVisibleComputers, queuePhotoCleanup, saveComputer, saveSession } from './db'
 import { describeSyncError, pullCloudData, subscribeToSharedInventory, synchronize, synchronizeAndPull } from './cloudSync'
 import { normalizeKey } from './utils'
 import type { ComputerRecord, InventorySession } from './types'
@@ -126,6 +128,7 @@ const seed = () => {
   store.deleteLog = []
   store.listeners = new Map()
   store.setHook = undefined
+  store.getDocsHook = undefined
   photoStore.failUpload = false
   photoStore.uploads = 0
   photoStore.failDeletes = 0
@@ -320,6 +323,358 @@ describe('descarga incremental de Firestore', () => {
     expect(stored.photo?.size).toBe(4)
     expect(stored.photoRemote?.fileId).toBe('photo-1')
     expect([...store.data.get('inventoryComputers')!.keys()].filter((id) => id === 'local-6')).toHaveLength(1)
+  })
+
+  it('un equipo con fotografía guardado sin Internet se sincroniza al recuperar la conexión', async () => {
+    vi.stubGlobal('navigator', { onLine: false })
+    const bytes = [0x89, 0x50, 0x4e, 0x47, 1, 2, 3]
+    await saveComputer({ ...localComputer(9), photo: new Blob([new Uint8Array(bytes)], { type: 'image/png' }), photoNeedsUpload: true, photoUploadStatus: 'pending' })
+    await synchronize('alice')
+    expect(store.setCalls).toBe(0)
+    let stored = (await listComputers()).find((item) => item.id === 'local-9')!
+    expect(stored.syncStatus).not.toBe('synced')
+    expect(Array.from(new Uint8Array(await stored.photo!.arrayBuffer()))).toEqual(bytes)
+    expect((await getPendingSyncQueue()).some((item) => item.id === 'computer:local-9')).toBe(true)
+    vi.stubGlobal('navigator', { onLine: true })
+    const result = await synchronize('alice', undefined, { force: true })
+    stored = (await listComputers()).find((item) => item.id === 'local-9')!
+    expect(result.pending).toBe(0)
+    expect(stored.syncStatus).toBe('synced')
+    expect(stored.photoRemote?.mimeType).toBe('image/png')
+    expect(store.data.get('inventoryComputers')!.get('local-9')).toBeDefined()
+  })
+
+  it('una edición local hecha mientras se descarga no se sobrescribe con datos remotos antiguos', async () => {
+    await pullCloudData('alice', { force: true })
+    store.data.get('inventoryComputers')!.set('c0', { ...remoteComputer(0, 'alice', 's0'), notes: 'remoto', updatedAt: minute(500) })
+    let fired = false
+    store.getDocsHook = async (name) => {
+      if (name !== 'inventoryComputers' || fired) return
+      fired = true
+      await saveComputer({ ...(await getComputer('c0'))!, notes: 'edición local' })
+    }
+    await pullCloudData('alice', { force: true })
+    expect(fired).toBe(true)
+    expect((await getComputer('c0'))?.notes).toBe('edición local')
+    store.getDocsHook = undefined
+    await synchronize('alice')
+    expect(store.data.get('inventoryComputers')!.get('c0')!.notes).toBe('edición local')
+  })
+
+  it('un borrado remoto no elimina localmente un equipo editado durante la descarga', async () => {
+    await pullCloudData('alice', { force: true })
+    store.data.get('inventoryComputers')!.delete('c0')
+    let fired = false
+    store.getDocsHook = async (name) => {
+      if (name !== 'inventoryComputers' || fired) return
+      fired = true
+      await saveComputer({ ...(await getComputer('c0'))!, notes: 'edición local' })
+    }
+    await pullCloudData('alice', { force: true })
+    store.getDocsHook = undefined
+    expect((await getComputer('c0'))?.notes).toBe('edición local')
+  })
+
+  it('una operación pendiente de otra cuenta no se ejecuta y queda intacta en la cola', async () => {
+    await saveSession(localSession('bob'))
+    await saveComputer(localComputer(9, 'bob'))
+    const before = JSON.stringify(await getPendingSyncQueue())
+    const result = await synchronize('alice', undefined, { force: true })
+    expect(result.synced).toBe(0)
+    expect(store.setCalls).toBe(0)
+    expect(store.deleteLog).toEqual([])
+    expect(JSON.stringify(await getPendingSyncQueue())).toBe(before)
+  })
+
+  it('una baja de un registro ajeno no se ejecuta, conserva el documento remoto y la operación queda con su error', async () => {
+    await pullCloudData('alice', { force: true })
+    const bobs = (await listComputers()).find((item) => item.ownerId === 'bob')!
+    await deleteComputer(bobs.id, 'alice')
+    const result = await synchronize('alice', undefined, { force: true })
+    expect(result.errors).toBeGreaterThan(0)
+    expect(store.deleteLog).toEqual([])
+    expect(store.data.get('inventoryComputers')!.has(bobs.cloudId!)).toBe(true)
+    const queued = (await getPendingSyncQueue()).find((item) => item.entityId === bobs.id)
+    expect(queued).toMatchObject({ operation: 'delete-computer', ownerId: 'alice' })
+    expect(queued?.lastError).toMatch(/creador/)
+  })
+
+  it('las operaciones pendientes de otra cuenta no bloquean las del usuario autenticado y siguen intactas', async () => {
+    await saveSession(localSession('alice'))
+    await saveSession({ ...localSession('bob'), id: 'bob-session' })
+    await saveComputer(localComputer(1, 'alice'))
+    await saveComputer({ ...localComputer(2, 'bob'), sessionId: 'bob-session' })
+    const bobsBefore = JSON.stringify((await getPendingSyncQueue()).filter((item) => item.ownerId === 'bob'))
+    const result = await synchronize('alice', undefined, { force: true })
+    expect(result).toMatchObject({ synced: 2, errors: 0, pending: 0 })
+    expect(store.data.get('inventoryComputers')!.has('local-1')).toBe(true)
+    expect(store.data.get('inventoryComputers')!.has('local-2')).toBe(false)
+    expect(JSON.stringify((await getPendingSyncQueue()).filter((item) => item.ownerId === 'bob'))).toBe(bobsBefore)
+  })
+
+  it('la baja de una sesión no espera bajas pendientes de otra cuenta y no modifica nada ajeno', async () => {
+    const bobsDocument = { ...remoteComputer(50, 'bob', 'local-session'), id: 'bobpc', cloudId: 'bobpc' }
+    store.data.get('inventoryComputers')!.set('bobpc', bobsDocument)
+    await saveSession(localSession('alice'))
+    await synchronize('alice', undefined, { force: true })
+    expect(store.data.get('inventorySessions')!.has('local-session')).toBe(true)
+    await deleteSessionAndComputers('local-session', 'alice')
+    const bobsOperation = { id: 'computer:bobpc', operation: 'delete-computer' as const, entityId: 'bobpc', remoteId: 'bobpc', sessionId: 'local-session', ownerId: 'bob', createdAt: minute(1), revision: 'bob-1', attempts: 2, lastError: 'sin red' }
+    await (await getDatabase()).put('syncQueue', bobsOperation)
+    const result = await synchronize('alice', undefined, { force: true })
+    expect(store.data.get('inventorySessions')!.has('local-session')).toBe(false)
+    expect(store.deleteLog).toEqual(['inventorySessions/local-session'])
+    expect(store.data.get('inventoryComputers')!.get('bobpc')).toBe(bobsDocument)
+    const queue = await getPendingSyncQueue()
+    expect(queue).toEqual([bobsOperation])
+    expect(result).toMatchObject({ errors: 0, pending: 0 })
+  })
+
+  it('las bajas pendientes propias de la misma sesión siguen teniendo que terminar antes de borrar la sesión', async () => {
+    const bobsDocument = { ...remoteComputer(50, 'bob', 'local-session'), id: 'bobpc', cloudId: 'bobpc' }
+    store.data.get('inventoryComputers')!.set('bobpc', bobsDocument)
+    await saveSession(localSession('alice'))
+    await synchronize('alice', undefined, { force: true })
+    await saveComputer({ ...localComputer(50, 'bob'), id: 'bobpc', cloudId: 'bobpc', sharedCloud: true }, false)
+    await deleteSessionAndComputers('local-session', 'alice') // encola una baja propia sobre un equipo ajeno, que se rechazará
+    const result = await synchronize('alice', undefined, { force: true })
+    expect(result.errors).toBeGreaterThan(0)
+    expect(store.data.get('inventorySessions')!.has('local-session')).toBe(true)
+    expect(store.data.get('inventoryComputers')!.get('bobpc')).toBe(bobsDocument)
+    expect(store.deleteLog).toEqual([])
+    expect((await getPendingSyncQueue()).map((item) => item.operation).sort()).toEqual(['delete-computer', 'delete-session'])
+  })
+
+  describe('alcances independientes de la sincronización', () => {
+    const photoBlob = () => new Blob([new Uint8Array([1, 2, 3])], { type: 'image/jpeg' })
+    const withPhoto = (n: number, owner = 'alice') => ({ ...localComputer(n, owner), photo: photoBlob(), photoNeedsUpload: true, photoUploadStatus: 'pending' as const, photoLocalRevision: `rev-${n}` })
+    const ownQueue = async () => (await getPendingSyncQueue()).map((item) => item.id).sort()
+
+    it('solo operaciones: sube el documento pero no la fotografía, que sigue local y pendiente', async () => {
+      await saveSession(localSession('alice'))
+      await saveComputer(withPhoto(1))
+      const result = await synchronize('alice', undefined, { force: true, scope: 'operations' })
+      expect(result).toMatchObject({ errors: 0, pending: 0 })
+      expect(store.data.get('inventoryComputers')!.has('local-1')).toBe(true)
+      expect(store.data.get('inventoryComputers')!.get('local-1')!.photoRemote).toBeUndefined()
+      expect(photoStore.uploads).toBe(0)
+      const stored = (await getComputer('local-1'))!
+      expect(stored.photo?.size).toBe(3)
+      expect(stored.photoRemote).toBeUndefined()
+      expect(stored.photoNeedsUpload).toBe(true)
+    })
+
+    it('solo operaciones no ejecuta limpiezas de ImageKit ni las elimina de la cola', async () => {
+      const previous = { fileId: 'old-photo', url: 'https://example.com/old.jpg', filePath: '/inventario/alice/old.jpg', name: 'old.jpg', size: 3, width: null, height: null, mimeType: 'image/jpeg', uploadedAt: minute(0) }
+      await saveSession(localSession('alice'))
+      await saveComputer({ ...localComputer(2), cloudId: 'local-2', sharedCloud: true, photoRemote: previous })
+      await synchronize('alice', undefined, { force: true })
+      await deleteComputer('local-2', 'alice')
+      const result = await synchronize('alice', undefined, { force: true, scope: 'operations' })
+      expect(result.errors).toBe(0)
+      expect(store.deleteLog).toContain('inventoryComputers/local-2')
+      expect(photoStore.deletes).toEqual([])
+      expect((await getPendingSyncQueue()).map((item) => item.operation)).toEqual(['cleanup-photo'])
+    })
+
+    it('solo fotografías: procesa únicamente equipos con foto pendiente y deja el resto de la cola intacta', async () => {
+      await saveSession(localSession('alice'))
+      await saveComputer(withPhoto(3))
+      await saveComputer(localComputer(4))
+      const before = (await getPendingSyncQueue()).filter((item) => item.entityId !== 'local-3')
+      const result = await synchronize('alice', undefined, { force: true, scope: 'photos' })
+      expect(result).toMatchObject({ errors: 0 })
+      expect(photoStore.uploads).toBe(1)
+      expect(store.data.get('inventoryComputers')!.get('local-3')!.photoRemote.fileId).toBe('photo-1')
+      expect(store.data.get('inventoryComputers')!.has('local-4')).toBe(false)
+      expect(store.data.get('inventorySessions')!.has('local-session')).toBe(false)
+      expect((await getPendingSyncQueue())).toEqual(before)
+      expect((await getComputer('local-3'))?.photo?.size).toBe(3)
+    })
+
+    it('operaciones y después fotografías equivale a una sincronización completa sin duplicar documentos ni archivos', async () => {
+      await saveSession(localSession('alice'))
+      await saveComputer(withPhoto(5))
+      await synchronize('alice', undefined, { force: true, scope: 'operations' })
+      await synchronize('alice', undefined, { force: true, scope: 'photos' })
+      await synchronize('alice', undefined, { force: true, scope: 'photos' })
+      expect(photoStore.uploads).toBe(1)
+      expect([...store.data.get('inventoryComputers')!.keys()].filter((key) => key === 'local-5')).toHaveLength(1)
+      expect(store.data.get('inventoryComputers')!.get('local-5')!.photoRemote.fileId).toBe('photo-1')
+      expect(await ownQueue()).toEqual([])
+    })
+
+    it('en ningún alcance se ejecutan operaciones de otra cuenta ni se suben fotografías ajenas', async () => {
+      await saveSession(localSession('bob'))
+      await saveComputer(withPhoto(6, 'bob'))
+      const before = JSON.stringify(await getPendingSyncQueue())
+      for (const scope of ['operations', 'photos', 'all'] as const) {
+        await synchronize('alice', undefined, { force: true, scope })
+      }
+      expect(store.setCalls).toBe(0)
+      expect(photoStore.uploads).toBe(0)
+      expect(JSON.stringify(await getPendingSyncQueue())).toBe(before)
+      expect((await getComputer('local-6'))?.photo?.size).toBe(3)
+    })
+
+    it('los registros excluidos no se tocan y el resto sí se procesa', async () => {
+      await saveSession(localSession('alice'))
+      await saveComputer(localComputer(7))
+      await saveComputer(localComputer(8))
+      const result = await synchronize('alice', undefined, { force: true, scope: 'operations', exclude: new Set(['local-7']) })
+      expect(result.errors).toBe(0)
+      expect(store.data.get('inventoryComputers')!.has('local-8')).toBe(true)
+      expect(store.data.get('inventoryComputers')!.has('local-7')).toBe(false)
+      expect((await getPendingSyncQueue()).map((item) => item.id)).toEqual(['computer:local-7'])
+    })
+
+    it('alcances distintos pedidos a la vez se ejecutan en secuencia, nunca en paralelo', async () => {
+      await saveSession(localSession('alice'))
+      await saveComputer(withPhoto(9))
+      store.setDelayMs = 5
+      await Promise.all([
+        synchronize('alice', undefined, { force: true, scope: 'operations' }),
+        synchronize('alice', undefined, { force: true, scope: 'photos' })
+      ])
+      expect(store.maxActiveSets).toBe(1)
+      expect(photoStore.uploads).toBe(1)
+    })
+
+    it('descargar con exclusiones no aplica los registros excluidos, no avanza el cursor y no toca los 39 importados', async () => {
+      await pullCloudData('alice', { force: true })
+      const imported = { ...localComputer(60), id: 'imp-alice-orig60', cloudId: 'imp-alice-orig60', importedFrom: { id: 'orig60', importedAt: minute(0) }, sharedCloud: true, syncStatus: 'synced' as const }
+      await saveComputer(imported, false)
+      store.data.get('inventoryComputers')!.set('imp-alice-orig60', { ...remoteComputer(60, 'alice', 'local-session'), id: 'imp-alice-orig60', cloudId: 'imp-alice-orig60', importedFrom: imported.importedFrom })
+      store.data.get('inventoryComputers')!.set('c1', { ...store.data.get('inventoryComputers')!.get('c1')!, notes: 'cambio remoto', updatedAt: minute(900) })
+      await pullCloudData('alice', { exclude: new Set(['c1']) })
+      expect((await getComputer('c1'))?.notes).toBe('')
+      await pullCloudData('alice') // sin exclusiones el mismo cambio sí llega: el cursor no se adelantó
+      expect((await getComputer('c1'))?.notes).toBe('cambio remoto')
+      const stored = (await getComputer('imp-alice-orig60'))!
+      expect(stored.ownerId).toBe('alice')
+      expect(stored.importedFrom?.id).toBe('orig60')
+    })
+
+    it('un error parcial en un alcance conserva la cola y el reintento termina sin duplicar documentos', async () => {
+      await saveSession(localSession('alice'))
+      await saveComputer(localComputer(80))
+      await saveComputer(localComputer(81))
+      await saveComputer(localComputer(82))
+      store.failSetAt = 3 // la tercera escritura falla (red interrumpida)
+      const first = await synchronize('alice', undefined, { force: true, scope: 'operations' })
+      expect(first.errors).toBeGreaterThan(0)
+      const remaining = (await getPendingSyncQueue()).map((item) => item.id)
+      expect(remaining.length).toBeGreaterThan(0)
+      expect(remaining.every((id) => id.startsWith('computer:') || id.startsWith('session:'))).toBe(true)
+      for (const id of remaining) expect((await getPendingSyncQueue()).find((item) => item.id === id)).toBeDefined()
+      store.failSetAt = 0
+      const retry = await synchronize('alice', undefined, { force: true, scope: 'operations' })
+      expect(retry).toMatchObject({ errors: 0, pending: 0 })
+      const keys = [...store.data.get('inventoryComputers')!.keys()]
+      for (const id of ['local-80', 'local-81', 'local-82']) expect(keys.filter((key) => key === id)).toHaveLength(1)
+      expect(await getPendingSyncQueue()).toEqual([])
+    })
+
+    it('si falla la subida de una fotografía la foto local y su operación se conservan y el reintento no duplica el archivo', async () => {
+      const bytes = () => new Blob([new Uint8Array([1, 2, 3])], { type: 'image/jpeg' })
+      await saveSession(localSession('alice'))
+      await saveComputer({ ...localComputer(83), photo: bytes(), photoNeedsUpload: true, photoUploadStatus: 'pending' as const, photoLocalRevision: 'rev-83' })
+      await synchronize('alice', undefined, { force: true, scope: 'operations' })
+      photoStore.failUpload = true
+      const failed = await synchronize('alice', undefined, { force: true, scope: 'photos' })
+      expect(failed.errors).toBeGreaterThan(0)
+      expect(photoStore.uploads).toBe(0)
+      const stored = (await getComputer('local-83'))!
+      expect(stored.photo?.size).toBe(3)
+      expect(stored.photoRemote).toBeUndefined()
+      expect((await getPendingSyncQueue()).map((item) => item.id)).toContain('computer:local-83')
+      photoStore.failUpload = false
+      await synchronize('alice', undefined, { force: true, scope: 'photos' })
+      await synchronize('alice', undefined, { force: true, scope: 'photos' })
+      expect(photoStore.uploads).toBe(1)
+      expect((await getComputer('local-83'))?.photoRemote?.fileId).toBe('photo-1')
+      expect((await getComputer('local-83'))?.photo?.size).toBe(3)
+    })
+
+    it('no escribe en Firestore antes de ejecutar un alcance: preparar la cola es local', async () => {
+      await saveComputer({ ...localComputer(84), sharedCloud: false }, false)
+      const { enqueueOwnUploads } = await import('./db')
+      expect(await enqueueOwnUploads('alice', ['local-84'])).toBe(1)
+      expect(store.setCalls).toBe(0)
+      expect(store.data.get('inventoryComputers')!.has('local-84')).toBe(false)
+    })
+
+    it('lo registrado sin internet se conserva al recargar, no se sube al volver la conexión y solo se envía tras la acción confirmada', async () => {
+      const bytes = () => new Blob([new Uint8Array([4, 5, 6])], { type: 'image/jpeg' })
+      vi.stubGlobal('navigator', { onLine: false })
+      await saveSession(localSession('alice'))
+      await saveComputer({ ...localComputer(90), photo: bytes(), photoNeedsUpload: true, photoUploadStatus: 'pending' as const, photoLocalRevision: 'rev-90' })
+      await saveComputer(localComputer(91))
+      ;(await getDatabase()).close() // recargar la aplicación
+      expect((await getComputer('local-90'))?.photo?.size).toBe(3)
+      expect((await getPendingSyncQueue()).length).toBeGreaterThanOrEqual(3)
+      expect(store.setCalls).toBe(0)
+      // Vuelve internet: no hay ninguna subida por sí sola.
+      vi.stubGlobal('navigator', { onLine: true })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(store.setCalls).toBe(0)
+      expect(photoStore.uploads).toBe(0)
+      // La persona revisa y confirma: solo entonces se sube, una sola vez por documento y por archivo.
+      await synchronize('alice', undefined, { force: true, scope: 'operations' })
+      await synchronize('alice', undefined, { force: true, scope: 'photos' })
+      await synchronize('alice', undefined, { force: true, scope: 'photos' })
+      const keys = [...store.data.get('inventoryComputers')!.keys()]
+      expect(keys.filter((key) => key === 'local-90')).toHaveLength(1)
+      expect(keys.filter((key) => key === 'local-91')).toHaveLength(1)
+      expect(photoStore.uploads).toBe(1)
+      expect((await getComputer('local-90'))?.photo?.size).toBe(3)
+      expect((await getComputer('local-90'))?.photoRemote?.fileId).toBe('photo-1')
+      expect(await getPendingSyncQueue()).toEqual([])
+    })
+
+    it('si Firebase falla a mitad de la subida confirmada, la cola y las fotos locales se conservan y el reintento no duplica', async () => {
+      const bytes = () => new Blob([new Uint8Array([4, 5, 6])], { type: 'image/jpeg' })
+      await saveSession(localSession('alice'))
+      await saveComputer({ ...localComputer(92), photo: bytes(), photoNeedsUpload: true, photoUploadStatus: 'pending' as const, photoLocalRevision: 'rev-92' })
+      await saveComputer(localComputer(93))
+      store.failSetAt = 2
+      const first = await synchronize('alice', undefined, { force: true, scope: 'operations' })
+      expect(first.errors).toBeGreaterThan(0)
+      expect((await getPendingSyncQueue()).length).toBeGreaterThan(0)
+      expect((await getComputer('local-92'))?.photo?.size).toBe(3)
+      store.failSetAt = 0
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        await synchronize('alice', undefined, { force: true, scope: 'operations' })
+        await synchronize('alice', undefined, { force: true, scope: 'photos' })
+      }
+      const keys = [...store.data.get('inventoryComputers')!.keys()]
+      expect(keys.filter((key) => key === 'local-92' || key === 'local-93').sort()).toEqual(['local-92', 'local-93'])
+      expect(photoStore.uploads).toBe(1)
+      expect(await getPendingSyncQueue()).toEqual([])
+    })
+
+    it('descargar sin eliminar registros locales conserva los que ya no existen en Firestore', async () => {
+      await pullCloudData('alice', { force: true })
+      const mirrored = (await listComputers()).find((item) => item.sharedCloud)!
+      store.data.get('inventoryComputers')!.delete(mirrored.cloudId!)
+      await pullCloudData('alice', { force: true, keepLocalRecords: true })
+      expect(await getComputer(mirrored.id)).toBeDefined()
+      await pullCloudData('alice', { force: true }) // el comportamiento normal sí concilia la baja remota
+      expect(await getComputer(mirrored.id)).toBeUndefined()
+    })
+
+    it('los 39 equipos importados ya sincronizados no generan escrituras en ningún alcance', async () => {
+      for (let n = 0; n < 39; n += 1) {
+        const id = `imp-alice-orig${n}`
+        const row = { ...localComputer(100 + n), id, cloudId: id, importedFrom: { id: `orig${n}`, importedAt: minute(0) }, sharedCloud: true, syncStatus: 'synced' as const, photoRemote: { fileId: `f${n}`, url: 'https://example.com/x', filePath: '/inventario/alice/x', name: 'x', size: 1, width: null, height: null, mimeType: 'image/jpeg', uploadedAt: minute(0) } }
+        await saveComputer(row, false)
+        store.data.get('inventoryComputers')!.set(id, { ...remoteComputer(100 + n, 'alice', 'local-session'), id, cloudId: id, photoRemote: row.photoRemote })
+      }
+      for (const scope of ['operations', 'photos', 'all'] as const) await synchronize('alice', undefined, { force: true, scope })
+      expect(store.setCalls).toBe(0)
+      expect(photoStore.uploads).toBe(0)
+      expect((await listComputers()).filter((item) => item.importedFrom && item.ownerId === 'alice')).toHaveLength(39)
+    })
   })
 
   it('descarga después de subir sin desaparecer ni duplicar el registro local', async () => {

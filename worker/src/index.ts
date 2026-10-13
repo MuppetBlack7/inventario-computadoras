@@ -86,6 +86,17 @@ async function loadComputerOptional(computerId: string, token: string, env: Env)
 const stringField = (fields: FirestoreFields | undefined, name: string) => fields?.[name]?.stringValue || ''
 const remotePhotoFields = (fields: FirestoreFields | undefined) => fields?.photoRemote?.mapValue?.fields
 
+/**
+ * La ruta de la fotografía sale del documento de Firestore, que su creador puede escribir libremente. Solo se firman
+ * archivos subidos por este Worker: `/inventario/<propietario del documento>/<nombre simple>`; así un documento
+ * manipulado no puede obtener enlaces firmados de otros archivos de la cuenta de ImageKit.
+ */
+export function isSafePhotoPath(filePath: string, ownerId: string) {
+  if (!ownerId || !/^[A-Za-z0-9_-]+$/.test(ownerId)) return false
+  const prefix = `/inventario/${ownerId}/`
+  return filePath.startsWith(prefix) && /^[A-Za-z0-9._-]+$/.test(filePath.slice(prefix.length)) && !filePath.slice(prefix.length).startsWith('.')
+}
+
 const imageKitAuthHeader = (privateKey: string) => `Basic ${btoa(`${privateKey}:`)}`
 
 async function imageKitUpload(request: Request, uid: string, computerId: string, env: Env): Promise<PhotoReference> {
@@ -214,6 +225,7 @@ export default {
         const storedFileId = stringField(storedPhoto, 'fileId')
         if (!storedFileId || storedFileId !== body.fileId) return json(origin, { error: 'Fotografía no asociada' }, 404)
         const filePath = stringField(storedPhoto, 'filePath')
+        if (!isSafePhotoPath(filePath, stringField(computer.fields, 'ownerId'))) return json(origin, { error: 'Fotografía no válida' }, 403)
         return json(origin, await buildSignedImageUrl(env.IMAGEKIT_URL_ENDPOINT, env.IMAGEKIT_PRIVATE_KEY, filePath, Boolean(body.thumbnail)))
       }
       if (action === 'cleanup-photo' || action === 'cleanup-replaced' || action === 'delete-current') {

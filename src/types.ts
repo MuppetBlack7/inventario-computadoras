@@ -15,6 +15,13 @@ export interface ImageKitPhotoReference {
   uploadedAt: string
 }
 
+/** Origen de un registro importado desde un respaldo compartido. No contiene datos del exportador. */
+export interface ImportedFrom {
+  /** Identificador que tenía el registro en el respaldo. */
+  id: string
+  importedAt: string
+}
+
 export interface StorageDrive {
   id: string
   capacityGB: number | null
@@ -34,6 +41,7 @@ export interface InventorySession {
   sharedCloud?: boolean
   syncStatus?: SyncStatus
   syncError?: string
+  importedFrom?: ImportedFrom
   createdAt: string
   updatedAt: string
 }
@@ -78,6 +86,7 @@ export interface ComputerRecord {
   photoUploadError?: string
   /** Cambia cada vez que el usuario selecciona una fotografía local distinta. */
   photoLocalRevision?: string
+  importedFrom?: ImportedFrom
   syncStatus?: SyncStatus
   syncError?: string
   createdAt: string

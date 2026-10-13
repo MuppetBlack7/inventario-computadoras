@@ -77,6 +77,17 @@ describe('inventario compartido autenticado', () => {
     await assertSucceeds(deleteDoc(doc(alice, 'inventoryComputers/alice-pc')))
   })
 
+  it('una restauración no puede escribir a nombre de otra cuenta ni reasignar la propiedad', async () => {
+    const alice = environment.authenticatedContext('alice').firestore()
+    const bob = environment.authenticatedContext('bob').firestore()
+    await assertFails(setDoc(doc(bob, 'inventoryComputers/alice-restored'), validComputer('alice', 'alice-restored')))
+    await assertFails(setDoc(doc(bob, 'inventorySessions/alice-session'), validSession('alice', 'alice-session')))
+    await assertSucceeds(setDoc(doc(alice, 'inventoryComputers/alice-pc'), validComputer('alice', 'alice-pc')))
+    await assertFails(setDoc(doc(bob, 'inventoryComputers/alice-pc'), validComputer('bob', 'alice-pc')))
+    await assertFails(updateDoc(doc(alice, 'inventoryComputers/alice-pc'), { ownerId: 'bob' }))
+    await assertSucceeds(setDoc(doc(alice, 'inventoryComputers/alice-pc'), { ...validComputer('alice', 'alice-pc'), notes: 'restaurado por su creador' }))
+  })
+
   it('permite que una cuenta nueva consulte y agregue sin lista previa de correos', async () => {
     const alice = environment.authenticatedContext('alice').firestore()
     const charlie = environment.authenticatedContext('charlie', { email: 'nueva@externo.example' }).firestore()

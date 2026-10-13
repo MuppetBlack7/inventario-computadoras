@@ -25,6 +25,13 @@ export const ScanLineIcon = ({ className }: IconProps) => <IconFrame className={
   <path d="M7 12h10" />
 </IconFrame>
 
+export const RefreshCwIcon = ({ className }: IconProps) => <IconFrame className={className}>
+  <path d="M21 12a9 9 0 0 0-15.5-6.2L3 8" />
+  <path d="M3 3v5h5" />
+  <path d="M3 12a9 9 0 0 0 15.5 6.2L21 16" />
+  <path d="M16 16h5v5" />
+</IconFrame>
+
 export const DatabaseBackupIcon = ({ className }: IconProps) => <IconFrame className={className}>
   <ellipse cx="12" cy="5" rx="7" ry="3" />
   <path d="M5 5v6c0 1.7 3.1 3 7 3 .7 0 1.4 0 2-.1" />
